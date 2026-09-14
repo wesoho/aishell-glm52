@@ -104,6 +104,41 @@ API Key:      any (不校验)
 Model:        gpt-4 (或 glm-5.2, default)
 ```
 
+## 经验教训
+
+> 部署过程中踩过的坑和解决方案，供后续参考。
+
+### 1. STS 临时凭证无法脱离沙箱获取
+
+API Key 是华为云 STS 临时凭证（~24h 过期），绑定沙箱会话，**无法脱离登录获取**。必须在华为云沙箱环境中运行，由 `JOB_ENV_MODEL_API_KEY` 自动注入。会话过期后 Key 失效返回 401，需重新登录刷新。
+
+### 2. 沙箱重部署会杀死所有子进程
+
+bwrap 容器重部署时，所有子进程（API 服务、Cloudflare 隧道）都会被杀死。解决方案：
+- 看门狗写成**独立脚本文件**（`/tmp/aishell-watchdog.sh`），通过 `setsid` 启动为独立会话
+- 看门狗不受主脚本的 `set -e` 影响，每 30s 轮询自动恢复挂掉的服务
+
+### 3. `set -euo pipefail` 的传染性
+
+bash 子脚本会继承父脚本的 `set -euo pipefail`，导致看门狗在任意命令返回非零时立即退出。解决方案：
+- 看门狗脚本开头显式 `set +e` 关闭错误退出
+- 使用独立脚本文件而非 `exec -a bash -c` 内嵌逻辑（后者还会丢失 PATH）
+
+### 4. 上游硬限速不可绕过
+
+TokenHub 上游 API 限制 **4 req/s**，这是服务端硬限制。令牌桶限速器只能**避免不必要的 429**（客户端侧排队），不能突破上游上限。20 并发时仍有约 25% 失败是上游瓶颈，只能通过降低并发或降低 `upstream_rate_limit` 来缓解。
+
+### 5. `exec -a bash -c` 嵌套子壳丢失 PATH
+
+使用 `exec -a bash -c` 创建命名子进程时，嵌套子壳内 PATH 会丢失，导致找不到 `python3`、`curl` 等可执行文件。解决方案：写独立 shell 脚本，开头显式 `export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"`。
+
+### 6. API Key 多策略快速获取
+
+原始方案扫描 `/proc/*/environ`（~50ms，且不稳定）。优化为三级策略：
+1. 环境变量 `os.environ.get()` — ~0ms
+2. 凭证文件 glob 匹配 — ~1ms
+3. `/proc/*/environ` 扫描 — ~50ms（兜底）
+
 ## 参考
 
 - [one-api](https://github.com/songquanpeng/one-api) - SSE headers, pass-through streaming
