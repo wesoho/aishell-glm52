@@ -175,9 +175,9 @@ fi
 
 # ── 步骤 1: 安装 Python 依赖 ──
 print_step "步骤 1/3: 安装 Python 依赖"
-if ! python3 -c "import fastapi, uvicorn" 2>/dev/null; then
+if ! python3 -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
     print_info "安装 FastAPI + Uvicorn..."
-    pip install -q fastapi uvicorn pydantic 2>&1 | tail -5
+    pip install -q fastapi uvicorn pydantic httpx 2>&1 | tail -5
 else
     print_success "Python 依赖已就绪"
 fi
@@ -361,7 +361,7 @@ echo ""
 
 echo -e "${CYAN}${BOLD}💡 自定义处理逻辑${NC}"
 echo ""
-echo -e "   修改 ${BOLD}main.py${NC} 中的 ${BOLD}process_request()${NC} 函数"
-echo -e "   替换为你的业务逻辑 (调用 AI 模型、数据库查询等)"
+echo -e "   修改 ${BOLD}main.py${NC} 中的上游模型配置和请求处理"
+echo -e "   当前为代理模式，直接转发到华为云内置 GLM 模型"
 echo -e "   修改后执行 ${YELLOW}./start.sh restart${NC} 生效"
 echo ""
