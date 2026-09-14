@@ -1,16 +1,19 @@
 # OpenAI 兼容 API 服务
 
-一个基于 FastAPI 的轻量级 API 服务，提供 **OpenAI 兼容接口**，可直接对接各类编程工具（Cursor、Copilot、OpenAI SDK 等）。通过 **Cloudflare Tunnel** 暴露到公网，受信任 HTTPS 地址，浏览器无安全提示。
+基于 FastAPI 的轻量级 API 服务，提供 **OpenAI 兼容接口**，可直接对接 Cursor、Copilot、OpenAI SDK 等工具。通过 **Cloudflare Tunnel** 暴露公网，受信任 HTTPS，浏览器无安全提示。
 
 ## 功能特性
 
-- ✅ **OpenAI 兼容**：`/v1/chat/completions`、`/v1/models` 接口格式完全兼容 OpenAI API
-- ✅ **通用处理**：`/process` 接口接收任意数据，灵活处理
+- ✅ **OpenAI 兼容**：`/v1/chat/completions`、`/v1/completions`、`/v1/models` 完全兼容 OpenAI API
+- ✅ **流式响应**：支持 `stream: true`，兼容 SSE 客户端
+- ✅ **CORS 支持**：浏览器前端可直接调用
+- ✅ **通用处理**：`/process` 接口接收任意数据 + options
 - ✅ **可插拔逻辑**：核心处理函数 `process_request()` 可自由替换
 - ✅ **零配置启动**：无需 API Key 校验，开箱即用
 - ✅ **自动文档**：内置 Swagger UI (`/docs`)
-- ✅ **Cloudflare 隧道**：一键启动脚本自动安装 cloudflared 并建立公网隧道
+- ✅ **Cloudflare 隧道**：一键脚本自动安装 cloudflared 并建立公网隧道
 - ✅ **GitHub 镜像加速**：通过 ghfast.top 等镜像代理下载，国内环境友好
+- ✅ **环境变量配置**：`API_PORT` 自定义端口，`NO_TUNNEL` 跳过隧道
 
 ## 一键启动
 
@@ -23,6 +26,31 @@ chmod +x start.sh && ./start.sh
 2. 启动 API 服务（端口 8080）
 3. 通过 GitHub 镜像代理下载安装 cloudflared
 4. 启动 Cloudflare 隧道，输出公网 HTTPS 地址
+
+### 脚本子命令
+
+```bash
+./start.sh              # 启动服务
+./start.sh stop         # 停止所有服务
+./start.sh restart      # 重启服务
+./start.sh status       # 查看运行状态
+./start.sh --help       # 显示帮助
+```
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `API_PORT` | `8080` | API 服务端口 |
+| `NO_TUNNEL` | `0` | 设为 `1` 则不启动 Cloudflare 隧道 |
+
+```bash
+# 自定义端口
+API_PORT=9000 ./start.sh
+
+# 仅启动 API，不启动隧道
+NO_TUNNEL=1 ./start.sh
+```
 
 ## 快速开始（手动）
 
@@ -37,6 +65,7 @@ pip install -r requirements.txt
 ```bash
 python main.py
 # 服务运行在 http://0.0.0.0:8080
+# 自定义端口: API_PORT=9000 python main.py
 ```
 
 ### 启动 Cloudflare 隧道
@@ -60,7 +89,7 @@ cloudflared tunnel --url http://localhost:8080
 
 ### 1. 聊天补全 — `POST /v1/chat/completions`
 
-OpenAI 标准聊天接口，兼容所有支持 OpenAI API 的工具。
+OpenAI 标准聊天接口，支持流式响应。
 
 **请求：**
 ```json
@@ -97,23 +126,33 @@ OpenAI 标准聊天接口，兼容所有支持 OpenAI API 的工具。
 }
 ```
 
-### 2. 模型列表 — `GET /v1/models`
+**流式响应** (`stream: true`)：返回 SSE 格式 `text/event-stream`，兼容 OpenAI SDK 流式调用。
+
+### 2. 文本补全 — `POST /v1/completions`
+
+```bash
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","prompt":"你好"}'
+```
+
+### 3. 模型列表 — `GET /v1/models`
 
 ```bash
 curl http://localhost:8080/v1/models
 ```
 
-### 3. 通用处理 — `POST /process`
+### 4. 通用处理 — `POST /process`
 
-接收任意数据，返回处理结果。
+接收任意数据 + options，返回处理结果。
 
 ```bash
 curl -X POST http://localhost:8080/process \
   -H "Content-Type: application/json" \
-  -d '{"data": "任意内容", "options": {}}'
+  -d '{"data": "任意内容", "options": {"key": "value"}}'
 ```
 
-### 4. 健康检查 — `GET /health`
+### 5. 健康检查 — `GET /health`
 
 ```bash
 curl http://localhost:8080/health
@@ -132,11 +171,21 @@ client = OpenAI(
     api_key="any"  # 不校验，任意值即可
 )
 
+# 普通调用
 response = client.chat.completions.create(
     model="default",
     messages=[{"role": "user", "content": "你的请求"}]
 )
 print(response.choices[0].message.content)
+
+# 流式调用
+for chunk in client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "你的请求"}],
+    stream=True
+):
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="")
 ```
 
 ### 外网调用（通过 Cloudflare 隧道）
@@ -181,6 +230,8 @@ Model: default
 def process_request(messages: List[Message], **kwargs) -> str:
     """
     自定义你的处理逻辑。
+    kwargs 可包含: model, temperature, max_tokens, top_p, options 等
+
     - 调用 AI 模型
     - 数据格式转换
     - 业务计算
@@ -195,14 +246,14 @@ def process_request(messages: List[Message], **kwargs) -> str:
     # 当前：回显消息
     parts = []
     for msg in messages:
-        content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content, ensure_ascii=False)
+        content = _content_to_str(msg.content)
         parts.append(f"[{msg.role}] {content}")
     return "\n".join(parts)
 ```
 
 修改后重启服务生效：
 ```bash
-kill $(lsof -t -i:8080) && python main.py &
+./start.sh restart
 ```
 
 ## 项目结构
@@ -211,7 +262,7 @@ kill $(lsof -t -i:8080) && python main.py &
 api-server/
 ├── main.py            # 主程序（FastAPI 应用 + 处理逻辑）
 ├── start.sh           # 一键启动脚本（API + Cloudflare 隧道）
-├── requirements.txt   # Python 依赖
+├── requirements.txt   # Python 依赖（版本锁定）
 └── README.md          # 说明文档
 ```
 
