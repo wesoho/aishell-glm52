@@ -1,11 +1,11 @@
 #!/bin/bash
 #===============================================================================
-# OpenAI 兼容 API 服务 一键启动脚本  v3.0
+# OpenAI 兼容 API 服务 一键启动脚本  v3.1
 #
 # 用法:
 #   ./start.sh              启动服务 (API + Cloudflare 隧道)
-#   ./start.sh stop         停止所有服务
-#   ./start.sh restart      重启服务
+#   ./start.sh stop         停止所有服务 (API + 隧道)
+#   ./start.sh restart      仅重启 API 服务，保留隧道（域名不变）
 #   ./start.sh status       查看运行状态
 #   ./start.sh logs         查看日志 (请求日志 + API 日志 + 隧道日志)
 #   ./start.sh logs -f      实时跟踪日志
@@ -32,6 +32,7 @@ CF_LOG="/tmp/cloudflared.log"
 REQ_LOG="/tmp/api-requests.log"
 API_PID_FILE="/tmp/api-server.pid"
 CF_PID_FILE="/tmp/cloudflared.pid"
+CF_URL_FILE="/tmp/cloudflared-url.txt"
 
 # ── 输出函数 ──
 print_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -47,8 +48,8 @@ OpenAI 兼容 API 服务启动脚本
 
 用法:
   ./start.sh              启动服务 (API + Cloudflare 隧道)
-  ./start.sh stop         停止所有服务
-  ./start.sh restart      重启服务
+  ./start.sh stop         停止所有服务 (API + 隧道)
+  ./start.sh restart      仅重启 API 服务，保留隧道（域名不变）
   ./start.sh status       查看运行状态
   ./start.sh logs         查看最近日志 (请求 + API + 隧道)
   ./start.sh logs -f      实时跟踪日志 (Ctrl+C 退出)
@@ -57,33 +58,59 @@ OpenAI 兼容 API 服务启动脚本
 环境变量:
   API_PORT      API 服务端口 (默认: 8080)
   NO_TUNNEL     设为 1 则不启动隧道 (默认: 启动)
-
-日志文件:
-  /tmp/api-requests.log       请求日志 (每个请求的方法/路径/IP/耗时/状态)
-  /tmp/api-server.log         API 服务日志 (启动/处理/错误)
-  /tmp/cloudflared.log         隧道日志 (连接/断开/错误)
 EOF
     exit 0
 }
 
-# ── 停止服务 ──
+# ── 获取隧道 URL ──
+get_tunnel_url() {
+    if [ -f "$CF_URL_FILE" ]; then
+        cat "$CF_URL_FILE" 2>/dev/null
+        return
+    fi
+    grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1 || true
+}
+
+# ── 检查隧道是否存活 ──
+tunnel_alive() {
+    [ -f "$CF_PID_FILE" ] && kill -0 "$(cat "$CF_PID_FILE" 2>/dev/null)" 2>/dev/null
+}
+
+# ── 停止 API 服务 ──
+stop_api() {
+    if [ -f "$API_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$API_PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            print_info "已停止 API PID=$pid"
+        fi
+        rm -f "$API_PID_FILE"
+    fi
+    pkill -f "python3.*main.py" 2>/dev/null || true
+}
+
+# ── 停止隧道 ──
+stop_tunnel() {
+    if [ -f "$CF_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$CF_PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            print_info "已停止隧道 PID=$pid"
+        fi
+        rm -f "$CF_PID_FILE"
+    fi
+    pkill -f "cloudflared tunnel" 2>/dev/null || true
+    rm -f "$CF_URL_FILE"
+}
+
+# ── 停止所有服务 ──
 stop_services() {
     print_step "停止服务"
     local stopped=0
-    for pidfile in "$API_PID_FILE" "$CF_PID_FILE"; do
-        if [ -f "$pidfile" ]; then
-            local pid
-            pid=$(cat "$pidfile" 2>/dev/null || true)
-            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                kill "$pid" 2>/dev/null || true
-                print_info "已停止 PID=$pid"
-                stopped=1
-            fi
-            rm -f "$pidfile"
-        fi
-    done
-    pkill -f "python3.*main.py" 2>/dev/null && stopped=1 || true
-    pkill -f "cloudflared tunnel" 2>/dev/null && stopped=1 || true
+    stop_api && stopped=1
+    stop_tunnel && stopped=1
     [ $stopped -eq 1 ] && print_success "服务已停止" || print_info "没有运行中的服务"
 }
 
@@ -101,9 +128,9 @@ show_status() {
         print_error "API 服务: 未运行"
     fi
 
-    if [ -f "$CF_PID_FILE" ] && kill -0 "$(cat "$CF_PID_FILE")" 2>/dev/null; then
+    if tunnel_alive; then
         local url
-        url=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1 || true)
+        url=$(get_tunnel_url)
         print_success "Cloudflare 隧道: 运行中 — ${url:-URL解析中...}"
         cf_ok=true
     else
@@ -120,121 +147,95 @@ show_logs() {
 
     if [ "$follow" = "-f" ]; then
         print_step "实时跟踪日志 (Ctrl+C 退出)"
-        echo -e "  ${DIM}请求日志: ${REQ_LOG}${NC}"
-        echo -e "  ${DIM}API 日志:  ${API_LOG}${NC}"
-        echo -e "  ${DIM}隧道日志:  ${CF_LOG}${NC}"
-        echo ""
         tail -f "$REQ_LOG" "$API_LOG" "$CF_LOG" 2>/dev/null
         exit 0
     fi
 
     print_step "请求日志 (最近 ${lines} 行)"
-    if [ -f "$REQ_LOG" ]; then
-        tail -n "$lines" "$REQ_LOG"
-    else
-        echo -e "  ${DIM}(暂无请求日志)${NC}"
-    fi
-
+    tail -n "$lines" "$REQ_LOG" 2>/dev/null || echo -e "  ${DIM}(暂无)${NC}"
     echo ""
     print_step "API 服务日志 (最近 ${lines} 行)"
-    if [ -f "$API_LOG" ]; then
-        tail -n "$lines" "$API_LOG"
-    else
-        echo -e "  ${DIM}(暂无 API 日志)${NC}"
-    fi
-
+    tail -n "$lines" "$API_LOG" 2>/dev/null || echo -e "  ${DIM}(暂无)${NC}"
     echo ""
     print_step "隧道日志 (最近 20 行)"
-    if [ -f "$CF_LOG" ]; then
-        tail -n 20 "$CF_LOG"
-    else
-        echo -e "  ${DIM}(暂无隧道日志)${NC}"
-    fi
+    tail -n 20 "$CF_LOG" 2>/dev/null || echo -e "  ${DIM}(暂无)${NC}"
     exit 0
 }
 
-# ── 子命令处理 ──
-case "${1:-}" in
-    --help|-h) show_help ;;
-    stop)      stop_services; exit 0 ;;
-    status)    show_status; exit $? ;;
-    logs)      show_logs "${2:-}"; exit 0 ;;
-    restart)   stop_services; sleep 1 ;;
-esac
-
-#===============================================================================
-# 启动流程
-#===============================================================================
-
-# ── 端口检查 ──
-if curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1; then
-    print_warn "端口 ${API_PORT} 已被占用，先停止旧服务..."
-    stop_services
-    sleep 2
-fi
-
-# ── 步骤 1: 安装 Python 依赖 ──
-print_step "步骤 1/3: 安装 Python 依赖"
-if ! python3 -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
-    print_info "安装 FastAPI + Uvicorn..."
-    pip install -q fastapi uvicorn pydantic httpx 2>&1 | tail -5
-else
-    print_success "Python 依赖已就绪"
-fi
-
-# ── 步骤 2: 启动 API 服务 ──
-print_step "步骤 2/3: 启动 API 服务 (端口 ${API_PORT})"
-
-# 快速注入 Model API Key（若环境变量未设置）
-if [ -z "${JOB_ENV_MODEL_API_KEY:-}" ]; then
-    # 策略 1: 已知凭证文件（毫秒级）
-    for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml /tmp/model_api_key.txt; do
-        if [ -f "$credfile" ] && grep -q "JOB_ENV_MODEL_API_KEY" "$credfile" 2>/dev/null; then
-            # YAML 格式提取
-            _key=$(grep 'JOB_ENV_MODEL_API_KEY' "$credfile" | head -1 | sed 's/.*: *"//' | sed 's/"$//')
-            if [ -n "$_key" ]; then
+# ── 注入 API Key ──
+inject_api_key() {
+    if [ -z "${JOB_ENV_MODEL_API_KEY:-}" ]; then
+        for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml /tmp/model_api_key.txt; do
+            if [ -f "$credfile" ] && grep -q "JOB_ENV_MODEL_API_KEY" "$credfile" 2>/dev/null; then
+                _key=$(grep 'JOB_ENV_MODEL_API_KEY' "$credfile" | head -1 | sed 's/.*: *"//' | sed 's/"$//')
+                if [ -n "$_key" ]; then
+                    export JOB_ENV_MODEL_API_KEY="$_key"
+                    print_success "从凭证文件注入 API Key"
+                    return
+                fi
+            fi
+        done
+        if [ -f /tmp/model_api_key.txt ]; then
+            _key=$(cat /tmp/model_api_key.txt | tr -d '[:space:]')
+            if [ -n "$_key" ] && [ ${#_key} -gt 20 ]; then
                 export JOB_ENV_MODEL_API_KEY="$_key"
-                print_success "从凭证文件注入 API Key"
-                break
+                print_success "从 /tmp/model_api_key.txt 注入 API Key"
+                return
             fi
         fi
-    done
-    # 策略 2: /proc 快速扫描（仅扫前几个进程）
-    if [ -z "${JOB_ENV_MODEL_API_KEY:-}" ]; then
         for pid in $(ls /proc 2>/dev/null | grep '^[0-9]*$' | head -50); do
             _key=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep '^JOB_ENV_MODEL_API_KEY=' | head -1 | cut -d= -f2-)
             if [ -n "$_key" ]; then
                 export JOB_ENV_MODEL_API_KEY="$_key"
                 print_success "从 /proc/$pid 注入 API Key"
-                break
+                return
             fi
         done
+        print_warn "未找到 API Key，上游请求将无认证"
     fi
-    [ -z "${JOB_ENV_MODEL_API_KEY:-}" ] && print_warn "未找到 API Key，上游请求将无认证"
-fi
+}
 
-cd "${SCRIPT_DIR}"
-API_PORT="${API_PORT}" setsid python3 main.py > "${API_LOG}" 2>&1 &
-API_PID=$!
-echo "$API_PID" > "$API_PID_FILE"
+# ── 启动 API 服务 ──
+start_api() {
+    print_step "启动 API 服务 (端口 ${API_PORT})"
+    inject_api_key
 
-for i in $(seq 1 15); do
-    if curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1; then
-        print_success "API 服务已启动 (PID=${API_PID})"
-        break
+    cd "${SCRIPT_DIR}"
+    API_PORT="${API_PORT}" setsid python3 main.py > "${API_LOG}" 2>&1 &
+    API_PID=$!
+    echo "$API_PID" > "$API_PID_FILE"
+
+    for i in $(seq 1 15); do
+        if curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1; then
+            print_success "API 服务已启动 (PID=${API_PID})"
+            return 0
+        fi
+        [ $i -eq 15 ] && { print_error "API 服务启动超时"; cat "${API_LOG}" | tail -20; return 1; }
+        sleep 1
+    done
+}
+
+# ── 启动 Cloudflare 隧道 ──
+start_tunnel() {
+    TUNNEL_URL=""
+    HAS_TUNNEL=false
+
+    if [ "${NO_TUNNEL:-0}" = "1" ]; then
+        print_step "跳过隧道 (NO_TUNNEL=1)"
+        return
     fi
-    [ $i -eq 15 ] && { print_error "API 服务启动超时"; cat "${API_LOG}" | tail -20; exit 1; }
-    sleep 1
-done
 
-# ── 步骤 3: 启动 Cloudflare 隧道 ──
-TUNNEL_URL=""
-HAS_TUNNEL=false
+    # 隧道已存活 — 复用，不重启
+    if tunnel_alive; then
+        TUNNEL_URL=$(get_tunnel_url)
+        if [ -n "$TUNNEL_URL" ]; then
+            print_success "隧道已在运行，复用现有隧道 — ${TUNNEL_URL}"
+            HAS_TUNNEL=true
+            return
+        fi
+    fi
 
-if [ "${NO_TUNNEL:-0}" = "1" ]; then
-    print_step "跳过隧道 (NO_TUNNEL=1)"
-else
-    print_step "步骤 3/3: 启动 Cloudflare 隧道"
+    print_step "启动 Cloudflare 隧道"
 
     if [ ! -x "${CLOUDFLARED_BIN}" ] || ! "${CLOUDFLARED_BIN}" version &>/dev/null; then
         print_info "下载 cloudflared..."
@@ -285,113 +286,108 @@ else
     done
 
     if [ -n "${TUNNEL_URL}" ]; then
-        print_success "隧道已建立 (PID=${CF_PID})"
+        echo "$TUNNEL_URL" > "$CF_URL_FILE"
+        print_success "隧道已建立 (PID=${CF_PID}) — ${TUNNEL_URL}"
         HAS_TUNNEL=true
     else
         print_warn "隧道 URL 尚未出现，查看日志: ${CF_LOG}"
         TUNNEL_URL="(请查看 ${CF_LOG})"
     fi
+}
+
+# ── 打印使用说明 ──
+print_usage() {
+    LOCAL_URL="http://localhost:${API_PORT}"
+    if [ "$HAS_TUNNEL" = true ]; then
+        PUBLIC_URL="${TUNNEL_URL}"
+    else
+        PUBLIC_URL="${LOCAL_URL}"
+    fi
+
+    echo ""
+    echo -e "${GREEN}${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${GREEN}${BOLD}│          ✅  服务启动成功，可以开始使用了！             │${NC}"
+    echo -e "${GREEN}${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "${CYAN}${BOLD}📍 访问地址${NC}"
+    echo -e "   ${GREEN}本地:${NC}  ${LOCAL_URL}"
+    if [ "$HAS_TUNNEL" = true ]; then
+        echo -e "   ${GREEN}外网:${NC}  ${PUBLIC_URL}"
+        echo -e "   ${DIM}(restart 只重启 API，不重启隧道，域名不变)${NC}"
+    fi
+    echo -e "   ${GREEN}文档:${NC}  ${LOCAL_URL}/docs"
+    echo ""
+    echo -e "${CYAN}${BOLD}🔧 快速测试${NC}"
+    echo -e "   ${YELLOW}curl ${LOCAL_URL}/v1/chat/completions -H 'Content-Type: application/json' \\${NC}"
+    echo -e "   ${YELLOW}  -d '{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'${NC}"
+    echo ""
+    echo -e "${CYAN}${BOLD}🖥️  Cursor / VS Code 配置${NC}"
+    echo -e "   ${GREEN}API Base URL:${NC}  ${PUBLIC_URL}/v1"
+    echo -e "   ${GREEN}API Key:${NC}       any (不校验)"
+    echo -e "   ${GREEN}Model:${NC}          default / gpt-4 / glm-5.2"
+    echo ""
+    echo -e "${CYAN}${BOLD}⚙️  服务管理${NC}"
+    echo -e "   ${YELLOW}./start.sh status${NC}    查看运行状态"
+    echo -e "   ${YELLOW}./start.sh stop${NC}      停止所有服务 (API + 隧道)"
+    echo -e "   ${YELLOW}./start.sh restart${NC}   仅重启 API，保留隧道域名"
+    echo -e "   ${YELLOW}./start.sh logs${NC}       查看日志"
+    echo ""
+}
+
+#===============================================================================
+# 子命令处理
+#===============================================================================
+
+case "${1:-}" in
+    --help|-h) show_help ;;
+    stop)      stop_services; exit 0 ;;
+    status)    show_status; exit $? ;;
+    logs)      show_logs "${2:-}"; exit 0 ;;
+esac
+
+# restart: 仅重启 API，保留隧道
+if [ "${1:-}" = "restart" ]; then
+    print_step "重启 API 服务（保留隧道）"
+    stop_api
+    sleep 1
+    start_api || exit 1
+    # 复用已有隧道
+    if tunnel_alive; then
+        TUNNEL_URL=$(get_tunnel_url)
+        HAS_TUNNEL=true
+    else
+        HAS_TUNNEL=false
+        TUNNEL_URL=""
+    fi
+    print_usage
+    exit 0
 fi
 
 #===============================================================================
-# 启动完成 — 打印使用说明
+# 正常启动流程
 #===============================================================================
 
-LOCAL_URL="http://localhost:${API_PORT}"
-if [ "$HAS_TUNNEL" = true ]; then
-    PUBLIC_URL="${TUNNEL_URL}"
+# 端口检查
+if curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1; then
+    print_warn "端口 ${API_PORT} 已被占用，先停止旧 API..."
+    stop_api
+    sleep 2
+fi
+
+# 步骤 1: 安装 Python 依赖
+print_step "步骤 1/3: 安装 Python 依赖"
+if ! python3 -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
+    print_info "安装 FastAPI + Uvicorn..."
+    pip install -q fastapi uvicorn pydantic httpx 2>&1 | tail -5
 else
-    PUBLIC_URL="${LOCAL_URL}"
+    print_success "Python 依赖已就绪"
 fi
 
-echo ""
-echo -e "${GREEN}${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
-echo -e "${GREEN}${BOLD}│          ✅  服务启动成功，可以开始使用了！             │${NC}"
-echo -e "${GREEN}${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
-echo ""
+# 步骤 2: 启动 API 服务
+start_api || exit 1
 
-echo -e "${CYAN}${BOLD}📍 访问地址${NC}"
-echo -e "   ${GREEN}本地:${NC}  ${LOCAL_URL}"
-if [ "$HAS_TUNNEL" = true ]; then
-    echo -e "   ${GREEN}外网:${NC}  ${PUBLIC_URL}"
-    echo -e "   ${DIM}(外网 HTTPS 地址，每次重启会变化)${NC}"
-fi
-echo -e "   ${GREEN}文档:${NC}  ${LOCAL_URL}/docs"
-echo ""
+# 步骤 3: 启动 Cloudflare 隧道（如已存活则复用）
+start_tunnel
 
-echo -e "${CYAN}${BOLD}🔧 快速测试 (复制即可运行)${NC}"
-echo ""
-echo -e "${DIM}# 1. 健康检查${NC}"
-echo -e "   ${YELLOW}curl ${LOCAL_URL}/health${NC}"
-echo ""
-echo -e "${DIM}# 2. 聊天对话${NC}"
-echo -e "   ${YELLOW}curl ${LOCAL_URL}/v1/chat/completions \\${NC}"
-echo -e "   ${YELLOW}  -H \"Content-Type: application/json\" \\${NC}"
-echo -e "   ${YELLOW}  -d '{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'${NC}"
-echo ""
-echo -e "${DIM}# 3. 查看模型列表${NC}"
-echo -e "   ${YELLOW}curl ${LOCAL_URL}/v1/models${NC}"
-echo ""
-
-echo -e "${CYAN}${BOLD}🐍 Python 调用 (OpenAI SDK)${NC}"
-echo ""
-echo -e "   ${DIM}from openai import OpenAI${NC}"
-echo ""
-echo -e "   ${DIM}client = OpenAI(${NC}"
-echo -e "   ${DIM}    base_url=\"${PUBLIC_URL}/v1\",${NC}"
-echo -e "   ${DIM}    api_key=\"any\"          # 不校验，随便填${NC}"
-echo -e "   ${DIM})${NC}"
-echo ""
-echo -e "   ${DIM}# 普通调用${NC}"
-echo -e "   ${DIM}resp = client.chat.completions.create(${NC}"
-echo -e "   ${DIM}    model=\"default\",${NC}"
-echo -e "   ${DIM}    messages=[{\"role\": \"user\", \"content\": \"你好\"}]${NC}"
-echo -e "   ${DIM})${NC}"
-echo -e "   ${DIM}print(resp.choices[0].message.content)${NC}"
-echo ""
-echo -e "   ${DIM}# 流式调用${NC}"
-echo -e "   ${DIM}for chunk in client.chat.completions.create(${NC}"
-echo -e "   ${DIM}    model=\"default\",${NC}"
-echo -e "   ${DIM}    messages=[{\"role\": \"user\", \"content\": \"你好\"}],${NC}"
-echo -e "   ${DIM}    stream=True${NC}"
-echo -e "   ${DIM}):${NC}"
-echo -e "   ${DIM}    if chunk.choices[0].delta.content:${NC}"
-echo -e "   ${DIM}        print(chunk.choices[0].delta.content, end=\"\")${NC}"
-echo ""
-
-echo -e "${CYAN}${BOLD}🖥️  Cursor / VS Code 配置${NC}"
-echo ""
-echo -e "   在设置中填入以下信息即可对接："
-echo ""
-echo -e "   ${GREEN}API Base URL:${NC}  ${PUBLIC_URL}/v1"
-echo -e "   ${GREEN}API Key:${NC}       any (不校验，随便填)"
-echo -e "   ${GREEN}Model:${NC}          default"
-echo ""
-
-echo -e "${CYAN}${BOLD}📋 接口一览${NC}"
-echo ""
-echo -e "   ${BLUE}POST${NC} /v1/chat/completions   OpenAI 兼容聊天 (支持 stream)"
-   ${BLUE}POST${NC} /v1/completions        OpenAI 文本补全
-   ${BLUE}POST${NC} /v1/embeddings         向量嵌入
-   ${BLUE}GET ${NC} /metrics               运行指标"
-echo -e "   ${BLUE}GET ${NC} /v1/models             模型列表"
-echo -e "   ${BLUE}POST${NC} /process               通用处理接口"
-echo -e "   ${BLUE}GET ${NC} /health                健康检查"
-echo -e "   ${BLUE}GET ${NC} /docs                  Swagger 交互式文档"
-echo ""
-
-echo -e "${CYAN}${BOLD}⚙️  服务管理${NC}"
-echo ""
-echo -e "   ${YELLOW}./start.sh status${NC}    查看运行状态"
-echo -e "   ${YELLOW}./start.sh stop${NC}      停止所有服务"
-echo -e "   ${YELLOW}./start.sh restart${NC}   重启服务"
-echo -e "   ${YELLOW}./start.sh logs${NC}       查看日志 (请求/API/隧道)"
-echo -e "   ${YELLOW}./start.sh logs -f${NC}    实时跟踪日志"
-echo ""
-
-echo -e "${CYAN}${BOLD}💡 自定义处理逻辑${NC}"
-echo ""
-echo -e "   修改 ${BOLD}main.py${NC} 中的上游模型配置和请求处理"
-echo -e "   当前为代理模式，直接转发到华为云内置 GLM 模型"
-echo -e "   修改后执行 ${YELLOW}./start.sh restart${NC} 生效"
-echo ""
+# 打印使用说明
+print_usage
