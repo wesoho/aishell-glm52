@@ -9,6 +9,7 @@
 - ✅ **可插拔逻辑**：核心处理函数 `process_request()` 可自由替换
 - ✅ **零配置启动**：无需 API Key 校验，开箱即用
 - ✅ **自动文档**：内置 Swagger UI (`/docs`)
+- ✅ **外网访问**：通过 SSH 隧道暴露，受信任 HTTPS 地址，无安全提示
 
 ## 快速开始
 
@@ -135,6 +136,38 @@ API Key: any
 Model: default
 ```
 
+## 外网访问
+
+服务通过 SSH 隧道（serveo.net）暴露到外网，提供受信任的 HTTPS 地址，浏览器无安全提示。
+
+**外网地址：**
+```
+https://28b208a631696a86-124-70-64-180.serveousercontent.com
+```
+
+**外网调用示例：**
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://28b208a631696a86-124-70-64-180.serveousercontent.com/v1",
+    api_key="any"
+)
+
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "你好"}]
+)
+print(response.choices[0].message.content)
+```
+
+**开启外网隧道：**
+```bash
+# 通过 serveo.net SSH 隧道暴露 8080 端口
+ssh -R 80:localhost:8080 serveo.net
+# 终端会输出外网 HTTPS 地址
+```
+
 ## 自定义处理逻辑
 
 修改 `main.py` 中的 `process_request()` 函数：
@@ -164,7 +197,6 @@ def process_request(messages: List[Message], **kwargs) -> str:
 
 修改后重启服务生效：
 ```bash
-# 重启
 kill $(lsof -t -i:8080) && python main.py &
 ```
 
@@ -182,24 +214,6 @@ api-server/
 - **FastAPI** — 高性能异步 Web 框架
 - **Uvicorn** — ASGI 服务器
 - **Pydantic** — 数据验证与序列化
-
-## 部署
-
-### 本地运行
-
-```bash
-python main.py
-```
-
-### 华为云沙箱 + DevBridge 隧道
-
-服务可部署到华为云沙箱环境，通过 DevBridge 隧道暴露到外网：
-
-```
-外网地址: https://<tunnelId>-8080.cn-north-4-bridge.myhuaweicloud.com
-```
-
-详见 [华为云 DevBridge 隧道文档](https://support.huaweicloud.com/devbridge/)。
 
 ## License
 
