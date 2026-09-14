@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         logger.info("HTTP 连接池已关闭")
 
 
-app = FastAPI(title="OpenAI Compatible API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="OpenAI Compatible API", version="3.0.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ──────────────────────────────────────────────
@@ -263,6 +263,12 @@ def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
     for key, value in body.items():
         if key not in SKIP_KEYS and value is not None:
             payload[key] = value
+    # 流式请求确保上游返回 usage (参考 one-api)
+    if is_stream:
+        if "stream_options" not in payload:
+            payload["stream_options"] = {"include_usage": True}
+        elif isinstance(payload["stream_options"], dict) and not payload["stream_options"].get("include_usage"):
+            payload["stream_options"]["include_usage"] = True
     return payload
 
 
@@ -644,7 +650,7 @@ async def health():
         "status": "ok", "time": int(time.time()),
         "upstream": UPSTREAM_BASE_URL, "model": UPSTREAM_DEFAULT_MODEL,
         "api_key_configured": bool(UPSTREAM_API_KEY),
-        "version": "3.0.0",
+        "version": "3.0.1",
     }
 
 
@@ -673,7 +679,7 @@ async def metrics():
 @app.get("/")
 async def root():
     return {
-        "service": "api-server", "version": "3.0.0", "mode": "proxy",
+        "service": "api-server", "version": "3.0.1", "mode": "proxy",
         "upstream": UPSTREAM_BASE_URL, "default_model": UPSTREAM_DEFAULT_MODEL,
         "available_models": ALL_MODELS,
         "model_aliases": MODEL_ALIASES,
