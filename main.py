@@ -256,30 +256,36 @@ def _parse_upstream_error(text: str) -> str:
         return text
 
 
+def _make_chunk_id(state: dict) -> str:
+    """生成 OpenAI 风格的 chatcmpl- ID"""
+    raw_id = state.get("chunk_id", "")
+    if raw_id.startswith("chatcmpl-"):
+        return raw_id
+    return f"chatcmpl-{raw_id}" if raw_id else f"chatcmpl-{int(time.time()*1000)}"
+
+
 def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
     """
-    转换流式 SSE chunk：
-    - 删除 reasoning_content、service_tier、first_token_return_time 等非标准字段
-    - 跳过 content 为空的 chunk（推理期间）
-    - 只在首个 chunk 保留 role
-    - 捕获 usage 供最终 chunk 使用
-    - 确保 [DONE] 前有 finish_reason chunk
+    转换流式 SSE chunk，严格对齐 OpenAI 格式：
+    - id 统一为 chatcmpl- 前缀
+    - 移除 usage: null（只在最终 chunk 带 usage）
+    - 移除 service_tier、first_token_return_time 等非标准字段
+    - 每个 choice 补 finish_reason: null（非最终 chunk）
+    - 首个 content chunk 拆为 role chunk + content chunk
+    - 确保 [DONE] 前有 finish_reason: stop 的 chunk
     """
     if not line.startswith("data: "):
         return None
     data_str = line[6:].strip()
     if data_str == "[DONE]":
         state["done_sent"] = True
-        # 如果上游没有发 finish_reason chunk，补一个
         if not state.get("finish_sent"):
-            chunk_id = state.get("chunk_id", "")
-            model = state.get("model", "")
-            created = state.get("created", int(time.time()))
+            cid = _make_chunk_id(state)
             fin_chunk = {
-                "id": chunk_id,
+                "id": cid,
                 "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
+                "created": state.get("created", int(time.time())),
+                "model": state.get("model", ""),
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
             if state.get("usage"):
@@ -294,8 +300,9 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
     # 剥离非标准字段
     chunk.pop("service_tier", None)
     chunk.pop("first_token_return_time", None)
+    chunk.pop("usage", None)  # 移除 usage: null，只在最终 chunk 带
 
-    # 记录 chunk 元信息
+    # 记录元信息
     if "id" in chunk:
         state["chunk_id"] = chunk["id"]
     if "model" in chunk:
@@ -303,9 +310,8 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
     if "created" in chunk:
         state["created"] = chunk["created"]
 
-    # 捕获 usage
-    if chunk.get("usage"):
-        state["usage"] = chunk["usage"]
+    # 统一 id 格式
+    chunk["id"] = _make_chunk_id(state)
 
     has_content = False
     has_finish = False
@@ -317,14 +323,34 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
         if delta.get("finish_reason"):
             has_finish = True
             state["finish_sent"] = True
+        else:
+            # 非最终 chunk 补 finish_reason: null
+            choice["finish_reason"] = None
+        # 非首 chunk 剥离 role（只在第一个 chunk 带 role）
         if delta.get("role") and not state["first"]:
             delta.pop("role", None)
 
     if not has_content and not has_finish:
         return None
 
+    # 首个 chunk: 如果同时有 role 和 content，拆成两个 chunk
+    if state["first"] and has_content:
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta", {})
+            if delta.get("role") and delta.get("content"):
+                content = delta["content"]
+                # 先发 role-only chunk
+                role_chunk = json.loads(json.dumps(chunk))
+                role_chunk["choices"][0]["delta"] = {"role": "assistant"}
+                role_chunk["choices"][0]["finish_reason"] = None
+                # 再发 content chunk
+                delta.pop("role", None)
+                state["first"] = False
+                return f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
     state["first"] = False
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
 
 # ──────────────────────────────────────────────
 # 上游调用
