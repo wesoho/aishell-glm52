@@ -1,10 +1,10 @@
 #!/bin/bash
 #===============================================================================
-# OpenAI 兼容 API 服务 一键启动脚本  v3.1
+# OpenAI 兼容 API 服务 一键启动脚本  v3.2
 #
 # 用法:
-#   ./start.sh              启动服务 (API + Cloudflare 隧道)
-#   ./start.sh stop         停止所有服务 (API + 隧道)
+#   ./start.sh              启动服务 (API + Cloudflare 隧道) + 保活看门狗
+#   ./start.sh stop         停止所有服务 (API + 隧道 + 看门狗)
 #   ./start.sh restart      仅重启 API 服务，保留隧道（域名不变）
 #   ./start.sh status       查看运行状态
 #   ./start.sh logs         查看日志 (请求日志 + API 日志 + 隧道日志)
@@ -14,6 +14,7 @@
 # 环境变量:
 #   API_PORT      API 服务端口 (默认 8080)
 #   NO_TUNNEL     设为 1 则不启动 Cloudflare 隧道
+#   NO_WATCHDOG   设为 1 则不启动保活看门狗
 #===============================================================================
 
 set -euo pipefail
@@ -33,6 +34,9 @@ REQ_LOG="/tmp/api-requests.log"
 API_PID_FILE="/tmp/api-server.pid"
 CF_PID_FILE="/tmp/cloudflared.pid"
 CF_URL_FILE="/tmp/cloudflared-url.txt"
+WATCHDOG_PID_FILE="/tmp/aishell-watchdog.pid"
+WATCHDOG_LOG="/tmp/aishell-watchdog.log"
+WATCHDOG_INTERVAL=30  # 检查间隔（秒）
 
 # ── 输出函数 ──
 print_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -47,8 +51,8 @@ show_help() {
 OpenAI 兼容 API 服务启动脚本
 
 用法:
-  ./start.sh              启动服务 (API + Cloudflare 隧道)
-  ./start.sh stop         停止所有服务 (API + 隧道)
+  ./start.sh              启动服务 (API + Cloudflare 隧道 + 保活看门狗)
+  ./start.sh stop         停止所有服务 (API + 隧道 + 看门狗)
   ./start.sh restart      仅重启 API 服务，保留隧道（域名不变）
   ./start.sh status       查看运行状态
   ./start.sh logs         查看最近日志 (请求 + API + 隧道)
@@ -58,6 +62,7 @@ OpenAI 兼容 API 服务启动脚本
 环境变量:
   API_PORT      API 服务端口 (默认: 8080)
   NO_TUNNEL     设为 1 则不启动隧道 (默认: 启动)
+  NO_WATCHDOG   设为 1 则不启动保活看门狗 (默认: 启动)
 EOF
     exit 0
 }
@@ -74,6 +79,11 @@ get_tunnel_url() {
 # ── 检查隧道是否存活 ──
 tunnel_alive() {
     [ -f "$CF_PID_FILE" ] && kill -0 "$(cat "$CF_PID_FILE" 2>/dev/null)" 2>/dev/null
+}
+
+# ── 检查 API 是否存活 ──
+api_alive() {
+    curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1
 }
 
 # ── 停止 API 服务 ──
@@ -105,10 +115,25 @@ stop_tunnel() {
     rm -f "$CF_URL_FILE"
 }
 
+# ── 停止看门狗 ──
+stop_watchdog() {
+    if [ -f "$WATCHDOG_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$WATCHDOG_PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            print_info "已停止看门狗 PID=$pid"
+        fi
+        rm -f "$WATCHDOG_PID_FILE"
+    fi
+    pkill -f "aishell-watchdog" 2>/dev/null || true
+}
+
 # ── 停止所有服务 ──
 stop_services() {
     print_step "停止服务"
     local stopped=0
+    stop_watchdog && stopped=1
     stop_api && stopped=1
     stop_tunnel && stopped=1
     [ $stopped -eq 1 ] && print_success "服务已停止" || print_info "没有运行中的服务"
@@ -117,9 +142,9 @@ stop_services() {
 # ── 查看状态 ──
 show_status() {
     print_step "运行状态"
-    local api_ok=false cf_ok=false
+    local api_ok=false cf_ok=false wd_ok=false
 
-    if curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1; then
+    if api_alive; then
         local health
         health=$(curl -s "http://localhost:${API_PORT}/health")
         print_success "API 服务: 运行中 (端口 ${API_PORT}) — ${health}"
@@ -137,7 +162,14 @@ show_status() {
         print_error "Cloudflare 隧道: 未运行"
     fi
 
-    $api_ok && $cf_ok && return 0 || return 1
+    if [ -f "$WATCHDOG_PID_FILE" ] && kill -0 "$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        print_success "保活看门狗: 运行中 (间隔 ${WATCHDOG_INTERVAL}s)"
+        wd_ok=true
+    else
+        print_error "保活看门狗: 未运行"
+    fi
+
+    $api_ok && $cf_ok && $wd_ok && return 0 || return 1
 }
 
 # ── 查看日志 ──
@@ -295,6 +327,99 @@ start_tunnel() {
     fi
 }
 
+# ── 保活看门狗 ──
+# 后台循环：每 30s 检查 API 和隧道，挂了就自动拉起
+start_watchdog() {
+    if [ "${NO_WATCHDOG:-0}" = "1" ]; then
+        return
+    fi
+
+    # 已在运行则跳过
+    if [ -f "$WATCHDOG_PID_FILE" ] && kill -0 "$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        print_success "看门狗已在运行"
+        return
+    fi
+
+    # 生成独立看门狗脚本
+    cat > /tmp/aishell-watchdog.sh << WD_EOF
+#!/bin/bash
+# aishell-glm52 保活看门狗 (自动生成)
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"
+
+API_PORT="${API_PORT}"
+SCRIPT_DIR="${SCRIPT_DIR}"
+interval=${WATCHDOG_INTERVAL}
+API_LOG="${API_LOG}"
+CF_LOG="${CF_LOG}"
+API_PID_FILE="${API_PID_FILE}"
+CF_PID_FILE="${CF_PID_FILE}"
+CF_URL_FILE="${CF_URL_FILE}"
+WATCHDOG_LOG="${WATCHDOG_LOG}"
+CLOUDFLARED_BIN="${CLOUDFLARED_BIN}"
+
+while true; do
+    sleep "\$interval" 2>/dev/null || exit 0
+    ts=\$(date "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "?")
+
+    # 检查 API
+    if ! curl -sf "http://localhost:\${API_PORT}/health" >/dev/null 2>&1; then
+        echo "[\$ts] API down, restarting..." >> "\$WATCHDOG_LOG"
+        pkill -f "python3.*main.py" 2>/dev/null
+        sleep 1
+        for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml /tmp/model_api_key.txt; do
+            if [ -f "\$credfile" ] && grep -q "JOB_ENV_MODEL_API_KEY" "\$credfile" 2>/dev/null; then
+                _key=\$(grep "JOB_ENV_MODEL_API_KEY" "\$credfile" 2>/dev/null | head -1 | sed 's/.*: *"//' | sed 's/"$//' 2>/dev/null)
+                if [ -n "\$_key" ]; then
+                    export JOB_ENV_MODEL_API_KEY="\$_key"
+                    break
+                fi
+            fi
+        done
+        cd "\$SCRIPT_DIR" 2>/dev/null
+        API_PORT="\$API_PORT" setsid python3 main.py >> "\$API_LOG" 2>&1 &
+        echo \$! > "\$API_PID_FILE" 2>/dev/null
+        sleep 3
+        if curl -sf "http://localhost:\${API_PORT}/health" >/dev/null 2>&1; then
+            echo "[\$ts] API restarted OK PID=\$(cat \$API_PID_FILE 2>/dev/null)" >> "\$WATCHDOG_LOG"
+        else
+            echo "[\$ts] API restart FAILED" >> "\$WATCHDOG_LOG"
+        fi
+    fi
+
+    # 检查隧道
+    cf_pid=\$(cat "\$CF_PID_FILE" 2>/dev/null)
+    if [ -z "\$cf_pid" ] || ! kill -0 "\$cf_pid" 2>/dev/null; then
+        echo "[\$ts] Tunnel down, restarting..." >> "\$WATCHDOG_LOG"
+        pkill -f "cloudflared tunnel" 2>/dev/null
+        sleep 1
+        setsid "\$CLOUDFLARED_BIN" tunnel --url "http://localhost:\${API_PORT}" > "\$CF_LOG" 2>&1 &
+        echo \$! > "\$CF_PID_FILE" 2>/dev/null
+        new_url=""
+        for w in \$(seq 1 20); do
+            new_url=\$(grep -oP "https://[a-z0-9-]+\.trycloudflare\.com" "\$CF_LOG" 2>/dev/null | head -1)
+            if [ -n "\$new_url" ]; then
+                break
+            fi
+            sleep 1
+        done
+        if [ -n "\$new_url" ]; then
+            echo "\$new_url" > "\$CF_URL_FILE" 2>/dev/null
+            echo "[\$ts] Tunnel restarted OK - \$new_url" >> "\$WATCHDOG_LOG"
+        else
+            echo "[\$ts] Tunnel restart FAILED" >> "\$WATCHDOG_LOG"
+        fi
+    fi
+done
+WD_EOF
+    chmod +x /tmp/aishell-watchdog.sh
+
+    setsid /tmp/aishell-watchdog.sh >/dev/null 2>&1 &
+    local wd_pid=$!
+    echo "$wd_pid" > "$WATCHDOG_PID_FILE"
+    print_success "保活看门狗已启动 (PID=${wd_pid}, 间隔 ${WATCHDOG_INTERVAL}s)"
+}
+
+
 # ── 打印使用说明 ──
 print_usage() {
     LOCAL_URL="http://localhost:${API_PORT}"
@@ -328,7 +453,7 @@ print_usage() {
     echo ""
     echo -e "${CYAN}${BOLD}⚙️  服务管理${NC}"
     echo -e "   ${YELLOW}./start.sh status${NC}    查看运行状态"
-    echo -e "   ${YELLOW}./start.sh stop${NC}      停止所有服务 (API + 隧道)"
+    echo -e "   ${YELLOW}./start.sh stop${NC}      停止所有服务 (API + 隧道 + 看门狗)"
     echo -e "   ${YELLOW}./start.sh restart${NC}   仅重启 API，保留隧道域名"
     echo -e "   ${YELLOW}./start.sh logs${NC}       查看日志"
     echo ""
@@ -388,6 +513,10 @@ start_api || exit 1
 
 # 步骤 3: 启动 Cloudflare 隧道（如已存活则复用）
 start_tunnel
+
+# 步骤 4: 启动保活看门狗
+print_step "步骤 4: 启动保活看门狗"
+start_watchdog
 
 # 打印使用说明
 print_usage
