@@ -26,6 +26,7 @@ import json
 import glob
 import uuid
 import asyncio
+import random
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
@@ -97,6 +98,13 @@ MAX_RETRIES = _cfg("max_retries", 2, int)
 RETRY_BACKOFF = _cfg("retry_backoff", 0.5, float)
 
 MAX_CONCURRENT = _cfg("max_concurrent", 20, int)
+
+# 上游速率限制 (令牌桶)
+UPSTREAM_RATE_LIMIT = _cfg("upstream_rate_limit", 4, float)   # 每秒允许请求数
+UPSTREAM_RATE_BURST = _cfg("upstream_rate_burst", 4, int)     # 突发桶大小
+# 429 专用重试 (比通用重试更激进)
+RETRY_429_MAX = _cfg("retry_429_max", 5, int)
+RETRY_429_BASE = _cfg("retry_429_base", 0.3, float)           # 基础等待
 
 MAX_BODY_SIZE = _cfg("max_body_size_mb", 10, int) * 1024 * 1024
 
@@ -211,6 +219,7 @@ logger.info(f"Upstream: {UPSTREAM_BASE_URL}")
 logger.info(f"Default model: {UPSTREAM_DEFAULT_MODEL}")
 logger.info(f"API key configured: {'yes' if UPSTREAM_API_KEY else 'no'}")
 logger.info(f"Max concurrent: {MAX_CONCURRENT}, Max retries: {MAX_RETRIES}")
+logger.info(f"Rate limit: {UPSTREAM_RATE_LIMIT}/s (burst={UPSTREAM_RATE_BURST}), 429 retry: {RETRY_429_MAX}")
 logger.info(f"Max body size: {MAX_BODY_SIZE // 1024 // 1024}MB, Log rotation: {LOG_MAX_BYTES // 1024 // 1024}MBx{LOG_BACKUP_COUNT}")
 
 # ──────────────────────────────────────────────
@@ -248,6 +257,57 @@ def get_semaphore() -> asyncio.Semaphore:
     if _semaphore is None:
         _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     return _semaphore
+
+
+# ── 令牌桶限速器 ──
+# 控制发往上游的请求速率，避免 429
+class _TokenBucket:
+    def __init__(self, rate: float, burst: int):
+        self.rate = rate          # 每秒补充令牌数
+        self.burst = burst        # 桶容量
+        self.tokens = float(burst)
+        self.last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                elapsed = now - self.last_refill
+                self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+                self.last_refill = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                # 需要等待的时间
+                wait = (1.0 - self.tokens) / self.rate
+        await asyncio.sleep(wait)
+
+_rate_limiter: Optional[_TokenBucket] = None
+
+# 全局 429 冷却：收到 429 后所有请求暂停
+_global_cooldown_until: float = 0.0
+_cooldown_lock = asyncio.Lock()
+
+async def _wait_cooldown():
+    """如果处于冷却期，等待结束"""
+    global _global_cooldown_until
+    now = time.monotonic()
+    if now < _global_cooldown_until:
+        wait = _global_cooldown_until - now
+        await asyncio.sleep(wait)
+
+async def _trigger_cooldown(seconds: float = 1.0):
+    """触发全局冷却"""
+    global _global_cooldown_until
+    async with _cooldown_lock:
+        _global_cooldown_until = max(_global_cooldown_until, time.monotonic() + seconds)
+
+def get_rate_limiter() -> _TokenBucket:
+    global _rate_limiter
+    if _rate_limiter is None:
+        _rate_limiter = _TokenBucket(UPSTREAM_RATE_LIMIT, UPSTREAM_RATE_BURST)
+    return _rate_limiter
 
 
 def _track_inflight(inc: bool):
@@ -609,16 +669,22 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
             retry_count = 0
             while retry_count <= MAX_RETRIES:
                 try:
+                    await _wait_cooldown()
+                    await get_rate_limiter().acquire()
                     async with get_semaphore():
                         async with client.stream("POST", url, json=payload, headers=headers) as resp:
                             if resp.status_code != 200:
                                 body = await resp.aread()
                                 err_text = body.decode("utf-8", errors="replace")[:500]
                                 err_msg, err_code = _parse_upstream_error(err_text)
-                                if _should_retry(resp.status_code) and retry_count < MAX_RETRIES:
+                                retry_max = RETRY_429_MAX if resp.status_code == 429 else MAX_RETRIES
+                                if _should_retry(resp.status_code) and retry_count < retry_max:
                                     retry_count += 1
-                                    wait = RETRY_BACKOFF * (2 ** (retry_count - 1))
-                                    logger.warning(f"[{request_id}] 上游 {resp.status_code}, 重试 {retry_count}/{MAX_RETRIES} ({wait}s)")
+                                    if resp.status_code == 429:
+                                        wait = RETRY_429_BASE * (2 ** (retry_count - 1)) + random.uniform(0, 0.1)
+                                    else:
+                                        wait = RETRY_BACKOFF * (2 ** (retry_count - 1))
+                                    logger.warning(f"[{request_id}] 上游 {resp.status_code}, 重试 {retry_count}/{retry_max} ({wait:.2f}s)")
                                     await asyncio.sleep(wait)
                                     continue
                                 logger.error(f"[{request_id}] 上游错误 {resp.status_code}: {err_msg}")
@@ -663,15 +729,22 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
     else:
         for attempt in range(MAX_RETRIES + 1):
             try:
+                await _wait_cooldown()
+                await get_rate_limiter().acquire()
                 async with get_semaphore():
                     resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
                     _record_usage(data.get("usage", {}))
                     return data
-                if _should_retry(resp.status_code) and attempt < MAX_RETRIES:
-                    wait = RETRY_BACKOFF * (2 ** attempt)
-                    logger.warning(f"[{request_id}] 上游 {resp.status_code}, 重试 {attempt+1}/{MAX_RETRIES} ({wait}s)")
+                retry_max = RETRY_429_MAX if resp.status_code == 429 else MAX_RETRIES
+                if _should_retry(resp.status_code) and attempt < retry_max:
+                    if resp.status_code == 429:
+                        await _trigger_cooldown(1.0)
+                        wait = RETRY_429_BASE * (2 ** attempt) + random.uniform(0, 0.1)
+                    else:
+                        wait = RETRY_BACKOFF * (2 ** attempt)
+                    logger.warning(f"[{request_id}] 上游 {resp.status_code}, 重试 {attempt+1}/{retry_max} ({wait:.2f}s)")
                     await asyncio.sleep(wait)
                     continue
                 err_msg, err_code = _parse_upstream_error(resp.text[:1000])
