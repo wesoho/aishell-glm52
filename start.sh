@@ -185,6 +185,34 @@ fi
 # ── 步骤 2: 启动 API 服务 ──
 print_step "步骤 2/3: 启动 API 服务 (端口 ${API_PORT})"
 
+# 快速注入 Model API Key（若环境变量未设置）
+if [ -z "${JOB_ENV_MODEL_API_KEY:-}" ]; then
+    # 策略 1: 已知凭证文件（毫秒级）
+    for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml /tmp/model_api_key.txt; do
+        if [ -f "$credfile" ] && grep -q "JOB_ENV_MODEL_API_KEY" "$credfile" 2>/dev/null; then
+            # YAML 格式提取
+            _key=$(grep 'JOB_ENV_MODEL_API_KEY' "$credfile" | head -1 | sed 's/.*: *"//' | sed 's/"$//')
+            if [ -n "$_key" ]; then
+                export JOB_ENV_MODEL_API_KEY="$_key"
+                print_success "从凭证文件注入 API Key"
+                break
+            fi
+        fi
+    done
+    # 策略 2: /proc 快速扫描（仅扫前几个进程）
+    if [ -z "${JOB_ENV_MODEL_API_KEY:-}" ]; then
+        for pid in $(ls /proc 2>/dev/null | grep '^[0-9]*$' | head -50); do
+            _key=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep '^JOB_ENV_MODEL_API_KEY=' | head -1 | cut -d= -f2-)
+            if [ -n "$_key" ]; then
+                export JOB_ENV_MODEL_API_KEY="$_key"
+                print_success "从 /proc/$pid 注入 API Key"
+                break
+            fi
+        done
+    fi
+    [ -z "${JOB_ENV_MODEL_API_KEY:-}" ] && print_warn "未找到 API Key，上游请求将无认证"
+fi
+
 cd "${SCRIPT_DIR}"
 API_PORT="${API_PORT}" setsid python3 main.py > "${API_LOG}" 2>&1 &
 API_PID=$!

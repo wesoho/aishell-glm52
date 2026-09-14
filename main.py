@@ -23,6 +23,7 @@ OpenAI 兼容 API 代理服务 (v3.1)
 import os
 import time
 import json
+import glob
 import uuid
 import asyncio
 import logging
@@ -108,25 +109,81 @@ API_PORT = _cfg("api_port", 8080, int)
 UPSTREAM_HEALTH_INTERVAL = _cfg("upstream_health_interval", 60, int)
 UPSTREAM_MODEL_REFRESH_INTERVAL = _cfg("upstream_model_refresh_interval", 300, int)
 
-# 如果环境变量没有 API_KEY，遍历 /proc 找
-if not UPSTREAM_API_KEY:
+# ── 多策略快速获取 Model API Key ──
+# 策略优先级: 环境变量 > 凭证文件 > /proc 精准扫描
+def _find_api_key() -> str:
+    """多策略快速获取 JOB_ENV_MODEL_API_KEY"""
+    # 策略 0: 环境变量（最快）
+    key = os.environ.get("JOB_ENV_MODEL_API_KEY", "")
+    if key:
+        return key
+
+    # 策略 1: 已知凭证文件路径（毫秒级，glob 匹配）
+    _KEY_MARK = "JOB_ENV_MODEL_API_KEY"
+    _credential_globs = [
+        "/root/job-envs/sandboxes/*/.dsh/.credentials.yaml",
+        "/root/job-envs/sandboxes/*/.jiuwenswarm/config/.env",
+        "/root/.dsh/.credentials.yaml",
+        "/tmp/model_api_key.txt",
+    ]
+    for pattern in _credential_globs:
+        for fpath in glob.glob(pattern):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    text = f.read()
+                # 纯 Key 值文件（如 /tmp/model_api_key.txt）
+                if _KEY_MARK not in text:
+                    val = text.strip()
+                    if val and len(val) > 20:
+                        return val
+                    continue
+                # YAML/env 格式: KEY: "value" 或 KEY=value
+                idx = text.find(_KEY_MARK)
+                rest = text[idx + len(_KEY_MARK):]
+                # 跳过 : 和空白
+                rest = rest.lstrip(": \t")
+                if rest.startswith('"'):
+                    end = rest.find('"', 1)
+                    if end > 0:
+                        return rest[1:end]
+                elif rest.startswith("'"):
+                    end = rest.find("'", 1)
+                    if end > 0:
+                        return rest[1:end]
+                else:
+                    # env 格式: KEY=value
+                    end = rest.find("\n")
+                    val = rest[:end] if end > 0 else rest.strip()
+                    if val:
+                        return val
+            except (OSError, UnicodeDecodeError):
+                continue
+
+    # 策略 2: /proc 精准扫描（os.scandir 比 listdir 快，跳过自身）
+    _PREFIX = b"JOB_ENV_MODEL_API_KEY="
+    _self_pid = os.getpid()
     try:
-        for pid_dir in os.listdir("/proc"):
-            if not pid_dir.isdigit():
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit() or int(entry.name) == _self_pid:
                 continue
             try:
-                with open(f"/proc/{pid_dir}/environ", "rb") as f:
-                    env_data = f.read()
-                for entry in env_data.split(b"\0"):
-                    if entry.startswith(b"JOB_ENV_MODEL_API_KEY="):
-                        UPSTREAM_API_KEY = entry.split(b"=", 1)[1].decode("utf-8")
-                        break
+                # 只读前 4KB，API Key 不会太靠后
+                with open(f"/proc/{entry.name}/environ", "rb") as f:
+                    env_data = f.read(4096)
+                idx = env_data.find(_PREFIX)
+                if idx != -1:
+                    val_start = idx + len(_PREFIX)
+                    val_end = env_data.find(b"\0", val_start)
+                    if val_end > val_start:
+                        return env_data[val_start:val_end].decode("utf-8")
             except (PermissionError, FileNotFoundError, ProcessLookupError):
                 continue
-            if UPSTREAM_API_KEY:
-                break
     except Exception:
         pass
+
+    return ""
+
+UPSTREAM_API_KEY = _find_api_key()
 
 # ──────────────────────────────────────────────
 # 日志配置 (带轮转)
