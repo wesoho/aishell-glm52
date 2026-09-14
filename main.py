@@ -120,7 +120,7 @@ async def lifespan(app: FastAPI):
         logger.info("HTTP 连接池已关闭")
 
 
-app = FastAPI(title="OpenAI Compatible API", version="2.4.0", lifespan=lifespan)
+app = FastAPI(title="OpenAI Compatible API", version="2.6.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -225,11 +225,11 @@ def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
         max_tokens = DEFAULT_MAX_TOKENS
     payload["max_tokens"] = max_tokens
 
-    for key in ("temperature", "top_p",
-                "frequency_penalty", "presence_penalty", "n", "user",
-                "stop", "seed"):
-        if key in body and body[key] is not None:
-            payload[key] = body[key]
+    # 转发所有额外参数到上游（tools, tool_choice, response_format, stream_options 等）
+    SKIP_KEYS = {"model", "messages", "stream", "max_tokens", "n"}
+    for key, value in body.items():
+        if key not in SKIP_KEYS and value is not None:
+            payload[key] = value
     return payload
 
 
@@ -300,7 +300,10 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
     # 剥离非标准字段
     chunk.pop("service_tier", None)
     chunk.pop("first_token_return_time", None)
-    chunk.pop("usage", None)  # 移除 usage: null，只在最终 chunk 带
+    # 保存 usage，只在最终 chunk 带
+    if "usage" in chunk and chunk["usage"] is not None:
+        state["usage"] = chunk["usage"]
+    chunk.pop("usage", None)
 
     # 记录元信息
     if "id" in chunk:
@@ -315,11 +318,14 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
 
     has_content = False
     has_finish = False
+    has_tool_calls = False
     for choice in chunk.get("choices", []):
         delta = choice.get("delta", {})
         delta.pop("reasoning_content", None)
         if delta.get("content"):
             has_content = True
+        if delta.get("tool_calls"):
+            has_tool_calls = True
         if delta.get("finish_reason"):
             has_finish = True
             state["finish_sent"] = True
@@ -330,20 +336,19 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
         if delta.get("role") and not state["first"]:
             delta.pop("role", None)
 
-    if not has_content and not has_finish:
+    if not has_content and not has_finish and not has_tool_calls:
         return None
 
-    # 首个 chunk: 如果同时有 role 和 content，拆成两个 chunk
-    if state["first"] and has_content:
+    # 首个 chunk: 如果同时有 role 和 content/tool_calls，拆成两个 chunk
+    if state["first"] and (has_content or has_tool_calls):
         for choice in chunk.get("choices", []):
             delta = choice.get("delta", {})
-            if delta.get("role") and delta.get("content"):
-                content = delta["content"]
+            if delta.get("role") and (delta.get("content") or delta.get("tool_calls")):
                 # 先发 role-only chunk
                 role_chunk = json.loads(json.dumps(chunk))
                 role_chunk["choices"][0]["delta"] = {"role": "assistant"}
                 role_chunk["choices"][0]["finish_reason"] = None
-                # 再发 content chunk
+                # 再发 content/tool_calls chunk
                 delta.pop("role", None)
                 state["first"] = False
                 return f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
@@ -392,16 +397,12 @@ async def call_upstream_chat(payload: dict, stream: bool = False):
                         if transformed:
                             yield transformed
                             last_keepalive = time.time()
-                        else:
-                            now = time.time()
-                            if now - last_keepalive > KEEPALIVE_INTERVAL:
-                                yield ": keepalive\n\n"
-                                last_keepalive = now
+                        # 不发送 keepalive 注释，某些 SSE 解析器不处理注释行
                     if not state.get("done_sent"):
                         # 补 finish_reason chunk
                         if not state.get("finish_sent"):
                             fin_chunk = {
-                                "id": state.get("chunk_id", ""),
+                                "id": _make_chunk_id(state),
                                 "object": "chat.completion.chunk",
                                 "created": state.get("created", int(time.time())),
                                 "model": state.get("model", ""),
@@ -598,7 +599,7 @@ async def health():
 async def root():
     return {
         "service": "api-server",
-        "version": "2.4.0",
+        "version": "2.6.0",
         "mode": "proxy",
         "upstream": UPSTREAM_BASE_URL,
         "default_model": UPSTREAM_DEFAULT_MODEL,
