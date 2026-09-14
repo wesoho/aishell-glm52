@@ -1,0 +1,29 @@
+{
+  "upstream_base_url": "https://tokenhub.developer.huaweicloud.com/v2",
+  "upstream_default_model": "openpangu-2.0-flash",
+  "upstream_models": ["openpangu-2.0-flash", "glm-5.2", "glm-5.1"],
+  "model_aliases": {
+    "default": "openpangu-2.0-flash",
+    "gpt-4": "glm-5.2",
+    "gpt-4o": "glm-5.2",
+    "gpt-4-turbo": "glm-5.2",
+    "gpt-3.5-turbo": "openpangu-2.0-flash",
+    "gpt-3.5": "openpangu-2.0-flash",
+    "claude-3-opus": "glm-5.2",
+    "claude-3-sonnet": "glm-5.2"
+  },
+  "default_max_tokens": 4096,
+  "connect_timeout": 10,
+  "read_timeout": 300,
+  "write_timeout": 300,
+  "max_retries": 2,
+  "retry_backoff": 0.5,
+  "max_concurrent": 20,
+  "max_body_size_mb": 10,
+  "log_file": "/tmp/api-server.log",
+  "log_max_bytes_mb": 10,
+  "log_backup_count": 5,
+  "api_port": 8080,
+  "upstream_health_interval": 60,
+  "upstream_model_refresh_interval": 300
+}

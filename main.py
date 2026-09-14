@@ -1,15 +1,21 @@
 """
-OpenAI 兼容 API 代理服务 (v3.0)
+OpenAI 兼容 API 代理服务 (v3.1)
 代理到华为云内置模型 (GLM-5.2 / openpangu-2.0-flash)
 
 特色:
-- 完整 OpenAI API 兼容 (chat/completions, completions, models, embeddings)
+- 完整 OpenAI API 兼容 (chat3, completions, models, embeddings)
 - 流式 SSE 严格对齐 OpenAI 格式
 - 模型别名映射 (gpt-4 → glm-5.2 等)
 - 上游错误自动重试 (指数退避)
 - 请求 ID 追踪, 结构化日志
 - 连接池复用, 并发控制
-- 可配置超时, 健康检查
+- 配置文件 + 环境变量双重配置
+- 请求体大小限制
+- Token 用量统计
+- 上游模型动态发现
+- 日志轮转
+- 优雅关机
+- 上游健康探测
 
 参考: one-api (songquanpeng), LiteLLM (BerriAI)
 """
@@ -20,6 +26,7 @@ import json
 import uuid
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
 
@@ -30,19 +37,44 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 # ──────────────────────────────────────────────
-# 配置
+# 配置加载: config.json → 环境变量覆盖
 # ──────────────────────────────────────────────
 
-UPSTREAM_BASE_URL = os.environ.get(
-    "JOB_ENV_MODEL_BASE_URL",
-    "https://tokenhub.developer.huaweicloud.com/v2",
-)
-UPSTREAM_API_KEY = os.environ.get("JOB_ENV_MODEL_API_KEY", "")
-UPSTREAM_DEFAULT_MODEL = "openpangu-2.0-flash"
-UPSTREAM_MODELS = ["openpangu-2.0-flash", "glm-5.2", "glm-5.1"]
+_CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")
+_config: dict = {}
 
-# 模型别名: 客户端可用的友好名 → 上游实际模型
-MODEL_ALIASES: Dict[str, str] = {
+try:
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+        _config = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+
+
+def _cfg(key: str, default=None, cast=str):
+    """从 config.json 或环境变量读取配置，环境变量优先"""
+    env_key = key.upper()
+    if env_key in os.environ:
+        val = os.environ[env_key]
+    elif key in _config:
+        val = _config[key]
+    else:
+        return default
+    if cast is str:
+        return val
+    if cast is bool:
+        return str(val).lower() in ("true", "1", "yes")
+    try:
+        return cast(val)
+    except (ValueError, TypeError):
+        return default
+
+
+UPSTREAM_BASE_URL = _cfg("upstream_base_url", "https://tokenhub.developer.huaweicloud.com/v2")
+UPSTREAM_API_KEY = os.environ.get("JOB_ENV_MODEL_API_KEY", "")
+UPSTREAM_DEFAULT_MODEL = _cfg("upstream_default_model", "openpangu-2.0-flash")
+UPSTREAM_MODELS: list = _config.get("upstream_models", ["openpangu-2.0-flash", "glm-5.2", "glm-5.1"])
+
+MODEL_ALIASES: Dict[str, str] = _config.get("model_aliases", {
     "default": UPSTREAM_DEFAULT_MODEL,
     "gpt-4": "glm-5.2",
     "gpt-4o": "glm-5.2",
@@ -51,22 +83,30 @@ MODEL_ALIASES: Dict[str, str] = {
     "gpt-3.5": "openpangu-2.0-flash",
     "claude-3-opus": "glm-5.2",
     "claude-3-sonnet": "glm-5.2",
-}
+})
 
 ALL_MODELS = list(MODEL_ALIASES.keys()) + UPSTREAM_MODELS
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = _cfg("default_max_tokens", 4096, int)
 
-# 超时配置
-CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "10"))
-READ_TIMEOUT = float(os.environ.get("READ_TIMEOUT", "300"))
-WRITE_TIMEOUT = float(os.environ.get("WRITE_TIMEOUT", "300"))
+CONNECT_TIMEOUT = _cfg("connect_timeout", 10, float)
+READ_TIMEOUT = _cfg("read_timeout", 300, float)
+WRITE_TIMEOUT = _cfg("write_timeout", 300, float)
 
-# 重试配置
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
-RETRY_BACKOFF = 0.5
+MAX_RETRIES = _cfg("max_retries", 2, int)
+RETRY_BACKOFF = _cfg("retry_backoff", 0.5, float)
 
-# 并发控制
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "20"))
+MAX_CONCURRENT = _cfg("max_concurrent", 20, int)
+
+MAX_BODY_SIZE = _cfg("max_body_size_mb", 10, int) * 1024 * 1024
+
+LOG_FILE = _cfg("log_file", "/tmp/api-server.log")
+LOG_MAX_BYTES = _cfg("log_max_bytes_mb", 10, int) * 1024 * 1024
+LOG_BACKUP_COUNT = _cfg("log_backup_count", 5, int)
+
+API_PORT = _cfg("api_port", 8080, int)
+
+UPSTREAM_HEALTH_INTERVAL = _cfg("upstream_health_interval", 60, int)
+UPSTREAM_MODEL_REFRESH_INTERVAL = _cfg("upstream_model_refresh_interval", 300, int)
 
 # 如果环境变量没有 API_KEY，遍历 /proc 找
 if not UPSTREAM_API_KEY:
@@ -89,10 +129,8 @@ if not UPSTREAM_API_KEY:
         pass
 
 # ──────────────────────────────────────────────
-# 日志配置
+# 日志配置 (带轮转)
 # ──────────────────────────────────────────────
-
-LOG_FILE = os.environ.get("API_LOG_FILE", "/tmp/api-server.log")
 
 logger = logging.getLogger("api-server")
 logger.setLevel(logging.DEBUG)
@@ -101,35 +139,40 @@ _ch = logging.StreamHandler()
 _ch.setLevel(logging.INFO)
 _ch.setFormatter(_fmt)
 logger.addHandler(_ch)
-_fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+_fh = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
 _fh.setLevel(logging.DEBUG)
 _fh.setFormatter(_fmt)
 logger.addHandler(_fh)
 
 req_logger = logging.getLogger("api-server.request")
 req_logger.setLevel(logging.DEBUG)
-_rfh = logging.FileHandler("/tmp/api-requests.log", mode="a", encoding="utf-8")
+_rfh = RotatingFileHandler("/tmp/api-requests.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
 _rfh.setFormatter(_fmt)
 req_logger.addHandler(_rfh)
-
-API_PORT = int(os.environ.get("API_PORT", "8080"))
 
 logger.info(f"Upstream: {UPSTREAM_BASE_URL}")
 logger.info(f"Default model: {UPSTREAM_DEFAULT_MODEL}")
 logger.info(f"API key configured: {'yes' if UPSTREAM_API_KEY else 'no'}")
 logger.info(f"Max concurrent: {MAX_CONCURRENT}, Max retries: {MAX_RETRIES}")
+logger.info(f"Max body size: {MAX_BODY_SIZE // 1024 // 1024}MB, Log rotation: {LOG_MAX_BYTES // 1024 // 1024}MBx{LOG_BACKUP_COUNT}")
 
 # ──────────────────────────────────────────────
-# 全局连接池 & 并发控制
+# 全局连接池 & 并发控制 & 状态
 # ──────────────────────────────────────────────
 
 UPSTREAM_TIMEOUT = httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT, write=WRITE_TIMEOUT)
 _http_client: Optional[httpx.AsyncClient] = None
 _semaphore: Optional[asyncio.Semaphore] = None
+_inflight_requests = 0
+
+_upstream_healthy = True
+_upstream_last_check = 0.0
+_upstream_models_dynamic: list = []
 
 _metrics = {
     "total_requests": 0, "total_errors": 0, "stream_requests": 0,
     "total_latency_ms": 0.0, "start_time": time.time(),
+    "total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0,
 }
 
 
@@ -150,24 +193,119 @@ def get_semaphore() -> asyncio.Semaphore:
     return _semaphore
 
 
+def _track_inflight(inc: bool):
+    global _inflight_requests
+    if inc:
+        _inflight_requests += 1
+    else:
+        _inflight_requests = max(0, _inflight_requests - 1)
+
+
+def _record_usage(usage: dict):
+    """记录 token 用量到 metrics"""
+    if not usage or not isinstance(usage, dict):
+        return
+    _metrics["total_tokens"] += usage.get("total_tokens", 0) or 0
+    _metrics["prompt_tokens"] += usage.get("prompt_tokens", 0) or 0
+    _metrics["completion_tokens"] += usage.get("completion_tokens", 0) or 0
+
+# ──────────────────────────────────────────────
+# 后台任务: 上游健康探测 + 模型刷新
+# ──────────────────────────────────────────────
+
+async def _upstream_health_task():
+    global _upstream_healthy, _upstream_last_check
+    while True:
+        try:
+            await asyncio.sleep(UPSTREAM_HEALTH_INTERVAL)
+            client = await get_client()
+            resp = await client.get(f"{UPSTREAM_BASE_URL}/models",
+                                    headers={"Authorization": f"Bearer {UPSTREAM_API_KEY}"},
+                                    timeout=httpx.Timeout(5.0, connect=3.0))
+            _upstream_healthy = resp.status_code == 200
+            _upstream_last_check = time.time()
+            if not _upstream_healthy:
+                logger.warning(f"上游健康检查失败: HTTP {resp.status_code}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            _upstream_healthy = False
+            _upstream_last_check = time.time()
+            logger.warning(f"上游健康检查异常: {e}")
+
+
+async def _upstream_model_refresh_task():
+    global _upstream_models_dynamic
+    while True:
+        try:
+            await asyncio.sleep(UPSTREAM_MODEL_REFRESH_INTERVAL)
+            client = await get_client()
+            resp = await client.get(f"{UPSTREAM_BASE_URL}/models",
+                                    headers={"Authorization": f"Bearer {UPSTREAM_API_KEY}"},
+                                    timeout=httpx.Timeout(10.0, connect=5.0))
+            if resp.status_code == 200:
+                data = resp.json()
+                models = []
+                if isinstance(data, dict) and "data" in data:
+                    for m in data["data"]:
+                        if isinstance(m, dict) and "id" in m:
+                            models.append(m["id"])
+                elif isinstance(data, list):
+                    models = [m.get("id", str(m)) if isinstance(m, dict) else str(m) for m in data]
+                if models:
+                    _upstream_models_dynamic = models
+                    logger.info(f"上游模型刷新: {models}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"上游模型刷新失败: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    health_task = asyncio.create_task(_upstream_health_task())
+    model_task = asyncio.create_task(_upstream_model_refresh_task())
+    logger.info("后台任务已启动: 上游健康探测 + 模型刷新")
+
     yield
+
+    # 优雅关机
+    health_task.cancel()
+    model_task.cancel()
+    try:
+        await asyncio.gather(health_task, model_task, return_exceptions=True)
+    except Exception:
+        pass
+
+    global _inflight_requests
+    wait_start = time.time()
+    while _inflight_requests > 0 and (time.time() - wait_start) < 10:
+        logger.info(f"优雅关机: 等待 {_inflight_requests} 个在途请求完成...")
+        await asyncio.sleep(0.5)
+
     global _http_client
     if _http_client and not _http_client.is_closed:
         await _http_client.aclose()
         logger.info("HTTP 连接池已关闭")
+    logger.info("服务已停止")
 
 
-app = FastAPI(title="OpenAI Compatible API", version="3.0.1", lifespan=lifespan)
+app = FastAPI(title="OpenAI Compatible API", version="3.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ──────────────────────────────────────────────
-# 请求日志中间件
+# 请求日志中间件 (含请求体大小限制)
 # ──────────────────────────────────────────────
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_BODY_SIZE:
+        return JSONResponse(
+            status_code=413,
+            content={"error": {"message": f"Request body too large. Max {MAX_BODY_SIZE // 1024 // 1024}MB.", "type": "request_too_large", "param": None, "code": "payload_too_large"}},
+        )
+
     request_id = request.headers.get("x-request-id", str(uuid.uuid4())[:8])
     request.state.request_id = request_id
     start_time = time.time()
@@ -176,16 +314,19 @@ async def request_logging_middleware(request: Request, call_next):
     ua = request.headers.get("user-agent", "")
     auth = request.headers.get("authorization", "")
 
-    req_logger.info(f"[{request_id}] → {method} {path} | IP={client_ip} | UA={ua[:60]} | Auth={'有' if auth else '无'}")
+    req_logger.info(f"[{request_id}] -> {method} {path} | IP={client_ip} | UA={ua[:60]} | Auth={'有' if auth else '无'}")
 
+    _track_inflight(True)
     try:
         response = await call_next(request)
     except Exception as e:
         elapsed = (time.time() - start_time) * 1000
-        req_logger.error(f"[{request_id}] ✗ {method} {path} | 500 | {elapsed:.1f}ms | {type(e).__name__}: {e}")
+        req_logger.error(f"[{request_id}] X {method} {path} | 500 | {elapsed:.1f}ms | {type(e).__name__}: {e}")
         _metrics["total_errors"] += 1
+        _track_inflight(False)
         return JSONResponse(status_code=500, content={"error": {"message": str(e), "type": "internal_error", "param": None, "code": None}}, headers={"x-request-id": request_id})
 
+    _track_inflight(False)
     elapsed = (time.time() - start_time) * 1000
     status = response.status_code
     response.headers["x-request-id"] = request_id
@@ -193,9 +334,9 @@ async def request_logging_middleware(request: Request, call_next):
     _metrics["total_latency_ms"] += elapsed
     if status >= 400:
         _metrics["total_errors"] += 1
-        req_logger.warning(f"[{request_id}] ✗ {method} {path} | {status} | {elapsed:.1f}ms")
+        req_logger.warning(f"[{request_id}] X {method} {path} | {status} | {elapsed:.1f}ms")
     else:
-        req_logger.info(f"[{request_id}] ← {method} {path} | {status} | {elapsed:.1f}ms")
+        req_logger.info(f"[{request_id}] <- {method} {path} | {status} | {elapsed:.1f}ms")
     return response
 
 # ──────────────────────────────────────────────
@@ -220,7 +361,6 @@ class ChatCompletionRequest(BaseModel):
 # ──────────────────────────────────────────────
 
 def _resolve_model(model: str) -> str:
-    """解析模型名: 别名 → 上游模型名"""
     if not model:
         return UPSTREAM_DEFAULT_MODEL
     if model in MODEL_ALIASES:
@@ -228,10 +368,17 @@ def _resolve_model(model: str) -> str:
     return model
 
 
+def _get_all_models() -> list:
+    models = set(MODEL_ALIASES.keys())
+    models.update(UPSTREAM_MODELS)
+    models.update(_upstream_models_dynamic)
+    return sorted(models)
+
+
 def _validate_model(model: str) -> Optional[str]:
-    if not model or model in MODEL_ALIASES or model in UPSTREAM_MODELS:
+    if not model or model in MODEL_ALIASES or model in UPSTREAM_MODELS or model in _upstream_models_dynamic:
         return None
-    return f"The model '{model}' does not exist. Available models: {', '.join(ALL_MODELS)}"
+    return f"The model '{model}' does not exist. Available models: {', '.join(_get_all_models())}"
 
 
 def _validate_messages(messages: list) -> Optional[str]:
@@ -248,7 +395,6 @@ def _validate_messages(messages: list) -> Optional[str]:
 
 
 def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
-    """构建上游请求，转发所有参数"""
     payload = {
         "model": _resolve_model(body.get("model", "default")),
         "messages": body.get("messages", []),
@@ -258,12 +404,10 @@ def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
     if not max_tokens or max_tokens <= 0:
         max_tokens = DEFAULT_MAX_TOKENS
     payload["max_tokens"] = max_tokens
-    # 转发所有额外参数 (tools, tool_choice, response_format, stream_options 等)
     SKIP_KEYS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
     for key, value in body.items():
         if key not in SKIP_KEYS and value is not None:
             payload[key] = value
-    # 流式请求确保上游返回 usage (参考 one-api)
     if is_stream:
         if "stream_options" not in payload:
             payload["stream_options"] = {"include_usage": True}
@@ -312,15 +456,6 @@ def _should_retry(status_code: int) -> bool:
 # ──────────────────────────────────────────────
 
 def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
-    """
-    转换流式 SSE chunk，严格对齐 OpenAI 格式:
-    - id 统一 chatcmpl- 前缀
-    - 移除非标准字段 (service_tier, first_token_return_time, reasoning_content)
-    - usage 只在最终 chunk 带
-    - 每个 choice 补 finish_reason: null (非最终 chunk)
-    - 首个 chunk 拆为 role chunk + content/tool_calls chunk
-    - 确保 [DONE] 前有 finish_reason: stop 的 chunk
-    """
     if not line.startswith("data: "):
         return None
     data_str = line[6:].strip()
@@ -332,7 +467,10 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
                    "model": state.get("model", ""), "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             if state.get("usage"):
                 fin["usage"] = state["usage"]
+                _record_usage(state["usage"])
             return f"data: {json.dumps(fin, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
+        if state.get("usage"):
+            _record_usage(state["usage"])
         return "data: [DONE]\n\n"
     try:
         chunk = json.loads(data_str)
@@ -444,6 +582,8 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
                                     if state.get("usage"):
                                         fin["usage"] = state["usage"]
                                     yield f"data: {json.dumps(fin, ensure_ascii=False)}\n\n"
+                                if state.get("usage"):
+                                    _record_usage(state["usage"])
                                 yield "data: [DONE]\n\n"
                             return
                 except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
@@ -464,13 +604,14 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
                     return
         return stream_generator()
     else:
-        # 非流式: 带重试
         for attempt in range(MAX_RETRIES + 1):
             try:
                 async with get_semaphore():
                     resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code == 200:
-                    return resp.json()
+                    data = resp.json()
+                    _record_usage(data.get("usage", {}))
+                    return data
                 if _should_retry(resp.status_code) and attempt < MAX_RETRIES:
                     wait = RETRY_BACKOFF * (2 ** attempt)
                     logger.warning(f"[{request_id}] 上游 {resp.status_code}, 重试 {attempt+1}/{MAX_RETRIES} ({wait}s)")
@@ -581,18 +722,18 @@ async def completions(raw_request: Request):
 async def list_models():
     now = int(time.time())
     data = []
-    # 先列别名
     for alias in MODEL_ALIASES:
         data.append({"id": alias, "object": "model", "created": now, "owned_by": "system"})
-    # 再列上游模型
     for model_id in UPSTREAM_MODELS:
         data.append({"id": model_id, "object": "model", "created": now, "owned_by": "huawei-cloud"})
+    for model_id in _upstream_models_dynamic:
+        if model_id not in UPSTREAM_MODELS and model_id not in MODEL_ALIASES:
+            data.append({"id": model_id, "object": "model", "created": now, "owned_by": "huawei-cloud-dynamic"})
     return {"object": "list", "data": data}
 
 
 @app.post("/v1/embeddings")
 async def embeddings(raw_request: Request):
-    """转发 embeddings 请求到上游"""
     request_id = getattr(raw_request.state, "request_id", "")
     try:
         body = await raw_request.json()
@@ -647,16 +788,19 @@ async def process(raw_request: Request):
 @app.get("/health")
 async def health():
     return {
-        "status": "ok", "time": int(time.time()),
-        "upstream": UPSTREAM_BASE_URL, "model": UPSTREAM_DEFAULT_MODEL,
+        "status": "ok" if _upstream_healthy else "degraded",
+        "upstream_healthy": _upstream_healthy,
+        "upstream_last_check": int(_upstream_last_check) if _upstream_last_check else 0,
+        "time": int(time.time()),
+        "upstream": UPSTREAM_BASE_URL,
+        "model": UPSTREAM_DEFAULT_MODEL,
         "api_key_configured": bool(UPSTREAM_API_KEY),
-        "version": "3.0.1",
+        "version": "3.1.0",
     }
 
 
 @app.get("/v1/health")
 async def health_v1():
-    """OpenAI 兼容健康检查路径"""
     return await health()
 
 
@@ -672,16 +816,23 @@ async def metrics():
         "error_rate": round(_metrics["total_errors"] / max(_metrics["total_requests"], 1) * 100, 2),
         "avg_latency_ms": round(avg_latency, 1),
         "concurrent_limit": MAX_CONCURRENT,
+        "inflight_requests": _inflight_requests,
         "upstream": UPSTREAM_BASE_URL,
+        "upstream_healthy": _upstream_healthy,
+        "tokens": {
+            "total": _metrics["total_tokens"],
+            "prompt": _metrics["prompt_tokens"],
+            "completion": _metrics["completion_tokens"],
+        },
     }
 
 
 @app.get("/")
 async def root():
     return {
-        "service": "api-server", "version": "3.0.1", "mode": "proxy",
+        "service": "api-server", "version": "3.1.0", "mode": "proxy",
         "upstream": UPSTREAM_BASE_URL, "default_model": UPSTREAM_DEFAULT_MODEL,
-        "available_models": ALL_MODELS,
+        "available_models": _get_all_models(),
         "model_aliases": MODEL_ALIASES,
         "endpoints": {
             "chat": "/v1/chat/completions",
