@@ -17,17 +17,42 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ──────────────────────────────────────────────
+# 日志配置 — 同时输出到控制台和文件
+# ──────────────────────────────────────────────
+
+LOG_FILE = os.environ.get("API_LOG_FILE", "/tmp/api-server.log")
+
 logger = logging.getLogger("api-server")
+logger.setLevel(logging.DEBUG)
+
+# 控制台 handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(console_handler)
+
+# 文件 handler — 记录 DEBUG 级别，包含请求/响应详情
+file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(file_handler)
+
+# 请求日志专用 logger
+req_logger = logging.getLogger("api-server.request")
+req_logger.setLevel(logging.DEBUG)
+req_file_handler = logging.FileHandler("/tmp/api-requests.log", mode="a", encoding="utf-8")
+req_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+req_logger.addHandler(req_file_handler)
 
 API_PORT = int(os.environ.get("API_PORT", "8080"))
 
-app = FastAPI(title="OpenAI Compatible API", version="1.1.0")
+app = FastAPI(title="OpenAI Compatible API", version="1.2.0")
 
 # CORS — 允许浏览器前端直接调用
 app.add_middleware(
@@ -36,6 +61,76 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ──────────────────────────────────────────────
+# 请求日志中间件 — 记录每个请求的详细信息
+# ──────────────────────────────────────────────
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    start_time = time.time()
+
+    # 读取请求体
+    body_bytes = await request.body()
+    body_text = body_bytes.decode("utf-8", errors="replace") if body_bytes else ""
+
+    # 构造日志记录
+    client_ip = request.client.host if request.client else "unknown"
+    method = request.method
+    path = request.url.path
+    query = str(request.url.query) if request.url.query else ""
+    full_path = f"{path}?{query}" if query else path
+
+    # 请求头中的关键信息
+    user_agent = request.headers.get("user-agent", "")
+    content_type = request.headers.get("content-type", "")
+    auth = request.headers.get("authorization", "")
+
+    # 截断过长的请求体
+    body_display = body_text[:2000] if len(body_text) > 2000 else body_text
+
+    req_logger.info(
+        f"→ {method} {full_path} | IP={client_ip} | "
+        f"UA={user_agent[:100]} | Content-Type={content_type} | "
+        f"Auth={'有' if auth else '无'} | "
+        f"Body={body_display}"
+    )
+
+    # 由于 body 已被读取，需要重新构造 request 供后续使用
+    async def receive():
+        return {"type": "http.request", "body": body_bytes, "more_body": False}
+    request._receive = receive
+
+    # 调用下一个中间件/路由
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        elapsed = (time.time() - start_time) * 1000
+        req_logger.error(
+            f"✗ {method} {full_path} | 500 | {elapsed:.1f}ms | "
+            f"ERROR: {type(e).__name__}: {e}"
+        )
+        logger.exception(f"请求处理异常: {method} {full_path}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e), "type": "internal_error"}},
+        )
+
+    elapsed = (time.time() - start_time) * 1000
+    status = response.status_code
+
+    # 记录响应日志
+    if status >= 400:
+        req_logger.warning(
+            f"✗ {method} {full_path} | {status} | {elapsed:.1f}ms"
+        )
+    else:
+        req_logger.info(
+            f"← {method} {full_path} | {status} | {elapsed:.1f}ms"
+        )
+
+    return response
+
 
 # ──────────────────────────────────────────────
 # 请求/响应模型 (OpenAI 兼容)
@@ -118,7 +213,7 @@ async def chat_completions(req: ChatCompletionRequest):
     try:
         result_text = process_request(req.messages, **extra)
     except Exception as e:
-        logger.exception("process_request failed")
+        logger.exception(f"process_request failed | model={req.model} | messages={req.messages}")
         return JSONResponse(
             status_code=500,
             content={"error": {"message": str(e), "type": "internal_error"}},
@@ -128,6 +223,12 @@ async def chat_completions(req: ChatCompletionRequest):
     completion_tokens = _estimate_tokens(result_text)
     created = int(time.time())
     resp_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    logger.info(
+        f"chat_completions | model={req.model} | stream={req.stream} | "
+        f"prompt_tokens={prompt_tokens} | completion_tokens={completion_tokens} | "
+        f"result={result_text[:200]}"
+    )
 
     # 流式响应
     if req.stream:
@@ -172,7 +273,7 @@ async def completions(req: CompletionRequest):
     try:
         result_text = process_request(msgs, **extra)
     except Exception as e:
-        logger.exception("process_request failed")
+        logger.exception(f"process_request failed | prompt={req.prompt[:200]}")
         return JSONResponse(
             status_code=500,
             content={"error": {"message": str(e), "type": "internal_error"}},
@@ -180,6 +281,11 @@ async def completions(req: CompletionRequest):
 
     prompt_tokens = _estimate_tokens(req.prompt)
     completion_tokens = _estimate_tokens(result_text)
+
+    logger.info(
+        f"completions | model={req.model} | stream={req.stream} | "
+        f"prompt_tokens={prompt_tokens} | completion_tokens={completion_tokens}"
+    )
 
     if req.stream:
         async def generate():
@@ -225,7 +331,7 @@ async def process(req: ProcessRequest):
     try:
         result = process_request(msgs, options=req.options)
     except Exception as e:
-        logger.exception("process failed")
+        logger.exception(f"process failed | data={str(req.data)[:200]}")
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
     return {"success": True, "result": result, "timestamp": int(time.time())}
 
@@ -243,7 +349,7 @@ async def health():
 async def root():
     return {
         "service": "api-server",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "endpoints": {
             "chat": "/v1/chat/completions",
             "completions": "/v1/completions",
@@ -258,4 +364,6 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"Starting API server on port {API_PORT}")
+    logger.info(f"Log file: {LOG_FILE}")
+    logger.info(f"Request log: /tmp/api-requests.log")
     uvicorn.run(app, host="0.0.0.0", port=API_PORT)
