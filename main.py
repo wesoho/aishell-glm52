@@ -15,6 +15,7 @@ import time
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
@@ -33,6 +34,7 @@ UPSTREAM_BASE_URL = os.environ.get(
 UPSTREAM_API_KEY = os.environ.get("JOB_ENV_MODEL_API_KEY", "")
 UPSTREAM_DEFAULT_MODEL = "openpangu-2.0-flash"
 UPSTREAM_MODELS = ["openpangu-2.0-flash", "glm-5.2", "glm-5.1"]
+ALL_MODELS = ["default"] + UPSTREAM_MODELS
 DEFAULT_MAX_TOKENS = 4096
 
 # 如果环境变量没有 API_KEY，遍历 /proc 找
@@ -84,7 +86,41 @@ logger.info(f"Upstream: {UPSTREAM_BASE_URL}")
 logger.info(f"Default model: {UPSTREAM_DEFAULT_MODEL}")
 logger.info(f"API key configured: {'yes' if UPSTREAM_API_KEY else 'no'}")
 
-app = FastAPI(title="OpenAI Compatible API", version="2.2.0")
+# ──────────────────────────────────────────────
+# 全局连接池 (复用 httpx.AsyncClient)
+# ──────────────────────────────────────────────
+
+UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
+KEEPALIVE_INTERVAL = 5.0
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+async def get_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=UPSTREAM_TIMEOUT,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=60.0,
+            ),
+        )
+    return _http_client
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期：启动时初始化，关闭时清理连接池"""
+    yield
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        logger.info("HTTP 连接池已关闭")
+
+
+app = FastAPI(title="OpenAI Compatible API", version="2.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -155,6 +191,15 @@ def _resolve_model(model: str) -> str:
     return model
 
 
+def _validate_model(model: str) -> Optional[str]:
+    """校验模型名，返回错误消息或 None"""
+    if not model or model == "default":
+        return None
+    if model not in UPSTREAM_MODELS:
+        return f"Model '{model}' not found. Available models: {', '.join(ALL_MODELS)}"
+    return None
+
+
 def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
     payload = {
         "model": _resolve_model(body.get("model", "default")),
@@ -187,7 +232,7 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
     - 删除 reasoning_content
     - 跳过 content 为空的 chunk（推理期间）
     - 只在首个 chunk 保留 role
-    state: {"first": True} 用于跟踪首 chunk
+    - 捕获 usage 供最终 chunk 使用
     """
     if not line.startswith("data: "):
         return None
@@ -200,6 +245,10 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
     except json.JSONDecodeError:
         return None
 
+    # 捕获 usage（上游可能在最终 chunk 带上）
+    if chunk.get("usage"):
+        state["usage"] = chunk["usage"]
+
     has_content = False
     has_finish = False
     for choice in chunk.get("choices", []):
@@ -209,17 +258,14 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
             has_content = True
         if delta.get("finish_reason"):
             has_finish = True
-        # 只在第一个 chunk 保留 role
         if delta.get("role") and not state["first"]:
             delta.pop("role", None)
 
-    # 跳过没有 content 且没有 finish_reason 的 chunk
     if not has_content and not has_finish:
         return None
 
     state["first"] = False
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
 
 # ──────────────────────────────────────────────
 # 上游调用
@@ -231,42 +277,39 @@ def _upstream_headers():
         "Authorization": f"Bearer {UPSTREAM_API_KEY}",
     }
 
-UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
-KEEPALIVE_INTERVAL = 5.0
-
 
 async def call_upstream_chat(payload: dict, stream: bool = False):
     url = f"{UPSTREAM_BASE_URL}/chat/completions"
     headers = _upstream_headers()
+    client = await get_client()
 
     if stream:
         async def stream_generator():
-            state = {"first": True}
+            state = {"first": True, "done_sent": False, "usage": None}
             last_keepalive = time.time()
             try:
-                async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-                    async with client.stream("POST", url, json=payload, headers=headers) as resp:
-                        if resp.status_code != 200:
-                            body = await resp.aread()
-                            err = body.decode("utf-8", errors="replace")[:500]
-                            logger.error(f"上游错误 {resp.status_code}: {err}")
-                            yield f"data: {json.dumps({'error': {'message': err, 'code': resp.status_code}})}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
-                        async for line in resp.aiter_lines():
-                            if not line.strip():
-                                continue
-                            transformed = _transform_stream_chunk(line, state)
-                            if transformed:
-                                yield transformed
-                                last_keepalive = time.time()
-                            else:
-                                now = time.time()
-                                if now - last_keepalive > KEEPALIVE_INTERVAL:
-                                    yield ": keepalive\n\n"
-                                    last_keepalive = now
-                        if not state.get("done_sent"):
-                            yield "data: [DONE]\n\n"
+                async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        err = body.decode("utf-8", errors="replace")[:500]
+                        logger.error(f"上游错误 {resp.status_code}: {err}")
+                        yield f"data: {json.dumps({'error': {'message': err, 'code': resp.status_code}})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        transformed = _transform_stream_chunk(line, state)
+                        if transformed:
+                            yield transformed
+                            last_keepalive = time.time()
+                        else:
+                            now = time.time()
+                            if now - last_keepalive > KEEPALIVE_INTERVAL:
+                                yield ": keepalive\n\n"
+                                last_keepalive = now
+                    if not state.get("done_sent"):
+                        yield "data: [DONE]\n\n"
             except httpx.ConnectError as e:
                 logger.error(f"上游连接失败: {e}")
                 yield f"data: {json.dumps({'error': {'message': f'连接上游失败: {e}'}})}\n\n"
@@ -277,13 +320,11 @@ async def call_upstream_chat(payload: dict, stream: bool = False):
                 yield "data: [DONE]\n\n"
         return stream_generator()
     else:
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code != 200:
-                logger.error(f"上游错误 {resp.status_code}: {resp.text[:500]}")
-                return {"error": True, "status": resp.status_code, "message": resp.text[:1000]}
-            return resp.json()
-
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            logger.error(f"上游错误 {resp.status_code}: {resp.text[:500]}")
+            return {"error": True, "status": resp.status_code, "message": resp.text[:1000]}
+        return resp.json()
 
 # ──────────────────────────────────────────────
 # API 接口
@@ -295,6 +336,12 @@ async def chat_completions(raw_request: Request):
         body = await raw_request.json()
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": {"message": f"Invalid JSON: {e}"}})
+
+    # 模型校验
+    model_input = body.get("model", "default")
+    model_err = _validate_model(model_input)
+    if model_err:
+        return JSONResponse(status_code=404, content={"error": {"message": model_err, "type": "invalid_request_error"}})
 
     is_stream = body.get("stream", False)
     payload = _build_upstream_payload(body, is_stream)
@@ -328,7 +375,12 @@ async def completions(raw_request: Request):
         return JSONResponse(status_code=400, content={"error": {"message": f"Invalid JSON: {e}"}})
 
     prompt = body.get("prompt", "")
-    model = _resolve_model(body.get("model", "default"))
+    model_input = body.get("model", "default")
+    model_err = _validate_model(model_input)
+    if model_err:
+        return JSONResponse(status_code=404, content={"error": {"message": model_err, "type": "invalid_request_error"}})
+
+    model = _resolve_model(model_input)
     is_stream = body.get("stream", False)
 
     chat_payload = {
@@ -341,7 +393,7 @@ async def completions(raw_request: Request):
         if key in body and body[key] is not None:
             chat_payload[key] = body[key]
 
-    logger.info(f"completions | model={model} | stream={is_stream} | prompt={prompt[:100]}")
+    logger.info(f"completions | model={model} | stream={is_stream} | prompt={str(prompt)[:100]}")
 
     if is_stream:
         gen = await call_upstream_chat(chat_payload, stream=True)
@@ -352,22 +404,43 @@ async def completions(raw_request: Request):
             return JSONResponse(status_code=result.get("status", 502),
                                 content={"error": {"message": result["message"], "type": "upstream_error"}})
         result = _strip_reasoning(result)
-        return JSONResponse(content=result)
 
+        # 转换为 OpenAI completions 格式 (text 而非 message)
+        choices = result.get("choices", [])
+        text_content = ""
+        finish_reason = "stop"
+        if choices:
+            text_content = choices[0].get("message", {}).get("content", "")
+            finish_reason = choices[0].get("finish_reason", "stop")
+
+        completion_response = {
+            "id": result.get("id", f"cmpl-{int(time.time())}"),
+            "object": "text_completion",
+            "created": result.get("created", int(time.time())),
+            "model": model,
+            "choices": [{
+                "text": text_content,
+                "index": 0,
+                "finish_reason": finish_reason,
+            }],
+            "usage": result.get("usage", {}),
+        }
+        return JSONResponse(content=completion_response)
 
 @app.get("/v1/models")
 async def list_models():
+    now = int(time.time())
     data = [{
         "id": "default",
         "object": "model",
-        "created": int(time.time()),
+        "created": now,
         "owned_by": "local",
     }]
-    for i, model_id in enumerate(UPSTREAM_MODELS):
+    for model_id in UPSTREAM_MODELS:
         data.append({
             "id": model_id,
             "object": "model",
-            "created": int(time.time()) - i,
+            "created": now,
             "owned_by": "huawei-cloud",
         })
     return {"object": "list", "data": data}
@@ -418,11 +491,11 @@ async def health():
 async def root():
     return {
         "service": "api-server",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "mode": "proxy",
         "upstream": UPSTREAM_BASE_URL,
         "default_model": UPSTREAM_DEFAULT_MODEL,
-        "available_models": UPSTREAM_MODELS,
+        "available_models": ALL_MODELS,
         "endpoints": {
             "chat": "/v1/chat/completions",
             "completions": "/v1/completions",
@@ -437,4 +510,11 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"Starting on port {API_PORT}, upstream={UPSTREAM_BASE_URL}, model={UPSTREAM_DEFAULT_MODEL}")
-    uvicorn.run(app, host="0.0.0.0", port=API_PORT)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=API_PORT,
+        log_level="info",
+        access_log=False,
+        timeout_keep_alive=30,
+    )
