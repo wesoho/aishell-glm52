@@ -1,6 +1,6 @@
 #!/bin/bash
 #===============================================================================
-# OpenAI 兼容 API 服务 一键启动脚本  v2.2
+# OpenAI 兼容 API 服务 一键启动脚本  v3.0
 #
 # 用法:
 #   ./start.sh              启动服务 (API + Cloudflare 隧道)
@@ -343,7 +343,9 @@ echo ""
 echo -e "${CYAN}${BOLD}📋 接口一览${NC}"
 echo ""
 echo -e "   ${BLUE}POST${NC} /v1/chat/completions   OpenAI 兼容聊天 (支持 stream)"
-echo -e "   ${BLUE}POST${NC} /v1/completions        OpenAI 文本补全"
+   ${BLUE}POST${NC} /v1/completions        OpenAI 文本补全
+   ${BLUE}POST${NC} /v1/embeddings         向量嵌入
+   ${BLUE}GET ${NC} /metrics               运行指标"
 echo -e "   ${BLUE}GET ${NC} /v1/models             模型列表"
 echo -e "   ${BLUE}POST${NC} /process               通用处理接口"
 echo -e "   ${BLUE}GET ${NC} /health                健康检查"
