@@ -1,6 +1,6 @@
 #!/bin/bash
 #===============================================================================
-# OpenAI 兼容 API 服务 一键启动脚本  v2.0
+# OpenAI 兼容 API 服务 一键启动脚本  v2.1
 #
 # 用法:
 #   ./start.sh              启动服务 (API + Cloudflare 隧道)
@@ -19,6 +19,7 @@ set -euo pipefail
 # ── 颜色 ──
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+BOLD='\033[1m'; DIM='\033[2m'
 
 # ── 配置 ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -101,7 +102,7 @@ show_status() {
 
     if [ -f "$CF_PID_FILE" ] && kill -0 "$(cat "$CF_PID_FILE")" 2>/dev/null; then
         local url
-        url=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1)
+        url=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1 || true)
         print_success "Cloudflare 隧道: 运行中 — ${url:-URL解析中...}"
         cf_ok=true
     else
@@ -131,7 +132,7 @@ if curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1; then
 fi
 
 # ── 步骤 1: 安装 Python 依赖 ──
-print_step "步骤 1: 安装 Python 依赖"
+print_step "步骤 1/3: 安装 Python 依赖"
 if ! python3 -c "import fastapi, uvicorn" 2>/dev/null; then
     print_info "安装 FastAPI + Uvicorn..."
     pip install -q fastapi uvicorn pydantic 2>&1 | tail -5
@@ -140,7 +141,7 @@ else
 fi
 
 # ── 步骤 2: 启动 API 服务 ──
-print_step "步骤 2: 启动 API 服务 (端口 ${API_PORT})"
+print_step "步骤 2/3: 启动 API 服务 (端口 ${API_PORT})"
 
 cd "${SCRIPT_DIR}"
 API_PORT="${API_PORT}" setsid python3 main.py > "${API_LOG}" 2>&1 &
@@ -159,11 +160,12 @@ done
 
 # ── 步骤 3: 启动 Cloudflare 隧道 ──
 TUNNEL_URL=""
+HAS_TUNNEL=false
 
 if [ "${NO_TUNNEL:-0}" = "1" ]; then
     print_step "跳过隧道 (NO_TUNNEL=1)"
 else
-    print_step "步骤 3: 启动 Cloudflare 隧道"
+    print_step "步骤 3/3: 启动 Cloudflare 隧道"
 
     # 安装 cloudflared (如未安装)
     if [ ! -x "${CLOUDFLARED_BIN}" ] || ! "${CLOUDFLARED_BIN}" version &>/dev/null; then
@@ -206,40 +208,128 @@ else
     CF_PID=$!
     echo "$CF_PID" > "$CF_PID_FILE"
 
-    # 等待隧道 URL (最多 20 秒)
+    # 等待隧道 URL (最多 30 秒)
     print_info "等待隧道建立..."
-    for i in $(seq 1 20); do
-        TUNNEL_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "${CF_LOG}" 2>/dev/null | head -1)
-        [ -n "${TUNNEL_URL}" ] && break
+    for i in $(seq 1 30); do
+        TUNNEL_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "${CF_LOG}" 2>/dev/null | head -1 || true)
+        if [ -n "${TUNNEL_URL}" ]; then
+            break
+        fi
         sleep 1
     done
 
     if [ -n "${TUNNEL_URL}" ]; then
         print_success "隧道已建立 (PID=${CF_PID})"
+        HAS_TUNNEL=true
     else
         print_warn "隧道 URL 尚未出现，查看日志: ${CF_LOG}"
         TUNNEL_URL="(请查看 ${CF_LOG})"
     fi
 fi
 
-# ── 完成 ──
-print_step "启动完成!"
+#===============================================================================
+# 启动完成 — 打印使用说明
+#===============================================================================
 
 LOCAL_URL="http://localhost:${API_PORT}"
+# 外网地址优先用隧道，没隧道就用本地
+if [ "$HAS_TUNNEL" = true ]; then
+    PUBLIC_URL="${TUNNEL_URL}"
+else
+    PUBLIC_URL="${LOCAL_URL}"
+fi
+
 echo ""
-echo -e "  ${GREEN}本地访问:${NC}  ${LOCAL_URL}"
-echo -e "  ${GREEN}外网访问:${NC}  ${TUNNEL_URL:-未启动隧道}"
-echo -e "  ${GREEN}API 文档:${NC}  ${LOCAL_URL}/docs"
+echo -e "${GREEN}${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
+echo -e "${GREEN}${BOLD}│          ✅  服务启动成功，可以开始使用了！             │${NC}"
+echo -e "${GREEN}${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
 echo ""
-echo -e "  ${CYAN}接口列表:${NC}"
-echo -e "    POST /v1/chat/completions   OpenAI 兼容聊天 (支持 stream)"
-echo -e "    POST /v1/completions        OpenAI 文本补全"
-echo -e "    GET  /v1/models             模型列表"
-echo -e "    POST /process               通用处理接口"
-echo -e "    GET  /health                健康检查"
+
+# ── 访问地址 ──
+echo -e "${CYAN}${BOLD}📍 访问地址${NC}"
+echo -e "   ${GREEN}本地:${NC}  ${LOCAL_URL}"
+if [ "$HAS_TUNNEL" = true ]; then
+    echo -e "   ${GREEN}外网:${NC}  ${PUBLIC_URL}"
+    echo -e "   ${DIM}(外网 HTTPS 地址，每次重启会变化)${NC}"
+fi
+echo -e "   ${GREEN}文档:${NC}  ${LOCAL_URL}/docs"
 echo ""
-echo -e "  ${YELLOW}停止服务:${NC}  ./start.sh stop"
-echo -e "  ${YELLOW}查看状态:${NC}  ./start.sh status"
-echo -e "  ${YELLOW}重启服务:${NC}  ./start.sh restart"
+
+# ── 快速测试 ──
+echo -e "${CYAN}${BOLD}🔧 快速测试 (复制即可运行)${NC}"
 echo ""
-echo -e "  ${YELLOW}提示:${NC} 修改 main.py 中的 process_request() 可自定义处理逻辑"
+echo -e "${DIM}# 1. 健康检查${NC}"
+echo -e "   ${YELLOW}curl ${LOCAL_URL}/health${NC}"
+echo ""
+echo -e "${DIM}# 2. 聊天对话${NC}"
+echo -e "   ${YELLOW}curl ${LOCAL_URL}/v1/chat/completions \\${NC}"
+echo -e "   ${YELLOW}  -H \"Content-Type: application/json\" \\${NC}"
+echo -e "   ${YELLOW}  -d '{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'${NC}"
+echo ""
+echo -e "${DIM}# 3. 查看模型列表${NC}"
+echo -e "   ${YELLOW}curl ${LOCAL_URL}/v1/models${NC}"
+echo ""
+
+# ── Python 调用 ──
+echo -e "${CYAN}${BOLD}🐍 Python 调用 (OpenAI SDK)${NC}"
+echo ""
+echo -e "   ${DIM}from openai import OpenAI${NC}"
+echo ""
+echo -e "   ${DIM}client = OpenAI(${NC}"
+echo -e "   ${DIM}    base_url=\"${PUBLIC_URL}/v1\",${NC}"
+echo -e "   ${DIM}    api_key=\"any\"          # 不校验，随便填${NC}"
+echo -e "   ${DIM})${NC}"
+echo ""
+echo -e "   ${DIM}# 普通调用${NC}"
+echo -e "   ${DIM}resp = client.chat.completions.create(${NC}"
+echo -e "   ${DIM}    model=\"default\",${NC}"
+echo -e "   ${DIM}    messages=[{\"role\": \"user\", \"content\": \"你好\"}]${NC}"
+echo -e "   ${DIM})${NC}"
+echo -e "   ${DIM}print(resp.choices[0].message.content)${NC}"
+echo ""
+echo -e "   ${DIM}# 流式调用${NC}"
+echo -e "   ${DIM}for chunk in client.chat.completions.create(${NC}"
+echo -e "   ${DIM}    model=\"default\",${NC}"
+echo -e "   ${DIM}    messages=[{\"role\": \"user\", \"content\": \"你好\"}],${NC}"
+echo -e "   ${DIM}    stream=True${NC}"
+echo -e "   ${DIM}):${NC}"
+echo -e "   ${DIM}    if chunk.choices[0].delta.content:${NC}"
+echo -e "   ${DIM}        print(chunk.choices[0].delta.content, end=\"\")${NC}"
+echo ""
+
+# ── Cursor / VS Code 配置 ──
+echo -e "${CYAN}${BOLD}🖥️  Cursor / VS Code 配置${NC}"
+echo ""
+echo -e "   在设置中填入以下信息即可对接："
+echo ""
+echo -e "   ${GREEN}API Base URL:${NC}  ${PUBLIC_URL}/v1"
+echo -e "   ${GREEN}API Key:${NC}       any (不校验，随便填)"
+echo -e "   ${GREEN}Model:${NC}          default"
+echo ""
+
+# ── 接口一览 ──
+echo -e "${CYAN}${BOLD}📋 接口一览${NC}"
+echo ""
+echo -e "   ${BLUE}POST${NC} /v1/chat/completions   OpenAI 兼容聊天 (支持 stream)"
+echo -e "   ${BLUE}POST${NC} /v1/completions        OpenAI 文本补全"
+echo -e "   ${BLUE}GET ${NC} /v1/models             模型列表"
+echo -e "   ${BLUE}POST${NC} /process               通用处理接口"
+echo -e "   ${BLUE}GET ${NC} /health                健康检查"
+echo -e "   ${BLUE}GET ${NC} /docs                  Swagger 交互式文档"
+echo ""
+
+# ── 服务管理 ──
+echo -e "${CYAN}${BOLD}⚙️  服务管理${NC}"
+echo ""
+echo -e "   ${YELLOW}./start.sh status${NC}    查看运行状态"
+echo -e "   ${YELLOW}./start.sh stop${NC}      停止所有服务"
+echo -e "   ${YELLOW}./start.sh restart${NC}   重启服务"
+echo ""
+
+# ── 自定义提示 ──
+echo -e "${CYAN}${BOLD}💡 自定义处理逻辑${NC}"
+echo ""
+echo -e "   修改 ${BOLD}main.py${NC} 中的 ${BOLD}process_request()${NC} 函数"
+echo -e "   替换为你的业务逻辑 (调用 AI 模型、数据库查询等)"
+echo -e "   修改后执行 ${YELLOW}./start.sh restart${NC} 生效"
+echo ""

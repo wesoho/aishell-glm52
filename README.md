@@ -14,6 +14,7 @@
 - ✅ **Cloudflare 隧道**：一键脚本自动安装 cloudflared 并建立公网隧道
 - ✅ **GitHub 镜像加速**：通过 ghfast.top 等镜像代理下载，国内环境友好
 - ✅ **环境变量配置**：`API_PORT` 自定义端口，`NO_TUNNEL` 跳过隧道
+- ✅ **人性化输出**：启动后自动打印访问地址、测试命令、代码示例、工具配置，开箱即用
 
 ## 一键启动
 
@@ -26,6 +27,38 @@ chmod +x start.sh && ./start.sh
 2. 启动 API 服务（端口 8080）
 3. 通过 GitHub 镜像代理下载安装 cloudflared
 4. 启动 Cloudflare 隧道，输出公网 HTTPS 地址
+5. **打印完整使用说明**（访问地址、测试命令、代码示例、工具配置）
+
+### 启动后输出示例
+
+脚本启动完成后会直接打印使用指南，用户无需翻文档即可上手：
+
+```
+✅  服务启动成功，可以开始使用了！
+
+📍 访问地址
+   本地:  http://localhost:8080
+   外网:  https://xxx.trycloudflare.com
+   文档:  http://localhost:8080/docs
+
+🔧 快速测试 (复制即可运行)
+   curl http://localhost:8080/health
+   curl http://localhost:8080/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{"model":"default","messages":[{"role":"user","content":"你好"}]}'
+
+🐍 Python 调用 (OpenAI SDK)
+   from openai import OpenAI
+   client = OpenAI(base_url="https://xxx.trycloudflare.com/v1", api_key="any")
+   ...
+
+🖥️  Cursor / VS Code 配置
+   API Base URL:  https://xxx.trycloudflare.com/v1
+   API Key:       any
+   Model:          default
+
+📋 接口一览 / ⚙️ 服务管理 / 💡 自定义处理逻辑
+```
 
 ### 脚本子命令
 
@@ -259,9 +292,9 @@ def process_request(messages: List[Message], **kwargs) -> str:
 ## 项目结构
 
 ```
-api-server/
+aishell-glm52/
 ├── main.py            # 主程序（FastAPI 应用 + 处理逻辑）
-├── start.sh           # 一键启动脚本（API + Cloudflare 隧道）
+├── start.sh           # 一键启动脚本（API + Cloudflare 隧道 + 使用说明）
 ├── requirements.txt   # Python 依赖（版本锁定）
 └── README.md          # 说明文档
 ```
@@ -280,6 +313,20 @@ api-server/
 - 受信任的 HTTPS 证书，浏览器无安全提示
 - 快速隧道 URL 每次启动会变化
 - 如需固定 URL，请配置 Cloudflare 命名隧道（需账号）
+
+## 更新日志
+
+### v2.1
+- 🎨 **人性化启动输出**：启动后自动打印访问地址、快速测试命令、Python 代码示例、Cursor/VS Code 配置、接口一览、服务管理命令，用户无需翻文档即可上手
+- 🐛 **修复隧道等待退出**：`set -euo pipefail` 下 `grep` 无匹配时脚本误退出，添加 `|| true` 保护
+- ⏱️ **隧道等待超时**：从 20 秒增加到 30 秒，适应网络较慢的环境
+
+### v2.0
+- 添加 Cloudflare Tunnel 一键启动支持
+- 添加 GitHub 镜像代理下载
+- 添加脚本子命令 (stop/restart/status)
+- 添加流式响应支持
+- 添加 CORS 支持
 
 ## License
 
