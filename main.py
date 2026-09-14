@@ -120,7 +120,7 @@ async def lifespan(app: FastAPI):
         logger.info("HTTP 连接池已关闭")
 
 
-app = FastAPI(title="OpenAI Compatible API", version="2.3.0", lifespan=lifespan)
+app = FastAPI(title="OpenAI Compatible API", version="2.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -200,6 +200,20 @@ def _validate_model(model: str) -> Optional[str]:
     return None
 
 
+def _validate_messages(messages: list) -> Optional[str]:
+    """校验 messages，返回错误消息或 None"""
+    if not messages:
+        return "messages is required and must not be empty."
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            return f"messages[{i}] must be an object."
+        if "role" not in msg:
+            return f"messages[{i}] must have a 'role' field."
+        if "content" not in msg:
+            return f"messages[{i}] must have a 'content' field."
+    return None
+
+
 def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
     payload = {
         "model": _resolve_model(body.get("model", "default")),
@@ -220,32 +234,76 @@ def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
 
 
 def _strip_reasoning(data: dict) -> dict:
+    """剥离非标准字段，保持 OpenAI 兼容"""
     for choice in data.get("choices", []):
         msg = choice.get("message", {})
         msg.pop("reasoning_content", None)
+    data.pop("service_tier", None)
     return data
+
+
+def _parse_upstream_error(text: str) -> str:
+    """解析上游错误，提取可读消息"""
+    try:
+        err = json.loads(text)
+        # 嵌套 error 对象
+        if "error" in err and isinstance(err["error"], dict):
+            return err["error"].get("message", text)
+        if "error_msg" in err:
+            return err["error_msg"]
+        return text
+    except (json.JSONDecodeError, TypeError):
+        return text
 
 
 def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
     """
     转换流式 SSE chunk：
-    - 删除 reasoning_content
+    - 删除 reasoning_content、service_tier、first_token_return_time 等非标准字段
     - 跳过 content 为空的 chunk（推理期间）
     - 只在首个 chunk 保留 role
     - 捕获 usage 供最终 chunk 使用
+    - 确保 [DONE] 前有 finish_reason chunk
     """
     if not line.startswith("data: "):
         return None
     data_str = line[6:].strip()
     if data_str == "[DONE]":
         state["done_sent"] = True
+        # 如果上游没有发 finish_reason chunk，补一个
+        if not state.get("finish_sent"):
+            chunk_id = state.get("chunk_id", "")
+            model = state.get("model", "")
+            created = state.get("created", int(time.time()))
+            fin_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            if state.get("usage"):
+                fin_chunk["usage"] = state["usage"]
+            return f"data: {json.dumps(fin_chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
         return "data: [DONE]\n\n"
     try:
         chunk = json.loads(data_str)
     except json.JSONDecodeError:
         return None
 
-    # 捕获 usage（上游可能在最终 chunk 带上）
+    # 剥离非标准字段
+    chunk.pop("service_tier", None)
+    chunk.pop("first_token_return_time", None)
+
+    # 记录 chunk 元信息
+    if "id" in chunk:
+        state["chunk_id"] = chunk["id"]
+    if "model" in chunk:
+        state["model"] = chunk["model"]
+    if "created" in chunk:
+        state["created"] = chunk["created"]
+
+    # 捕获 usage
     if chunk.get("usage"):
         state["usage"] = chunk["usage"]
 
@@ -258,6 +316,7 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
             has_content = True
         if delta.get("finish_reason"):
             has_finish = True
+            state["finish_sent"] = True
         if delta.get("role") and not state["first"]:
             delta.pop("role", None)
 
@@ -285,15 +344,19 @@ async def call_upstream_chat(payload: dict, stream: bool = False):
 
     if stream:
         async def stream_generator():
-            state = {"first": True, "done_sent": False, "usage": None}
+            state = {
+                "first": True, "done_sent": False, "finish_sent": False,
+                "usage": None, "chunk_id": "", "model": "", "created": 0,
+            }
             last_keepalive = time.time()
             try:
                 async with client.stream("POST", url, json=payload, headers=headers) as resp:
                     if resp.status_code != 200:
                         body = await resp.aread()
-                        err = body.decode("utf-8", errors="replace")[:500]
-                        logger.error(f"上游错误 {resp.status_code}: {err}")
-                        yield f"data: {json.dumps({'error': {'message': err, 'code': resp.status_code}})}\n\n"
+                        err_text = body.decode("utf-8", errors="replace")[:500]
+                        err_msg = _parse_upstream_error(err_text)
+                        logger.error(f"上游错误 {resp.status_code}: {err_msg}")
+                        yield f"data: {json.dumps({'error': {'message': err_msg, 'code': resp.status_code}})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
                     async for line in resp.aiter_lines():
@@ -309,6 +372,18 @@ async def call_upstream_chat(payload: dict, stream: bool = False):
                                 yield ": keepalive\n\n"
                                 last_keepalive = now
                     if not state.get("done_sent"):
+                        # 补 finish_reason chunk
+                        if not state.get("finish_sent"):
+                            fin_chunk = {
+                                "id": state.get("chunk_id", ""),
+                                "object": "chat.completion.chunk",
+                                "created": state.get("created", int(time.time())),
+                                "model": state.get("model", ""),
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            }
+                            if state.get("usage"):
+                                fin_chunk["usage"] = state["usage"]
+                            yield f"data: {json.dumps(fin_chunk, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
             except httpx.ConnectError as e:
                 logger.error(f"上游连接失败: {e}")
@@ -322,8 +397,9 @@ async def call_upstream_chat(payload: dict, stream: bool = False):
     else:
         resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code != 200:
-            logger.error(f"上游错误 {resp.status_code}: {resp.text[:500]}")
-            return {"error": True, "status": resp.status_code, "message": resp.text[:1000]}
+            err_msg = _parse_upstream_error(resp.text[:1000])
+            logger.error(f"上游错误 {resp.status_code}: {err_msg}")
+            return {"error": True, "status": resp.status_code, "message": err_msg}
         return resp.json()
 
 # ──────────────────────────────────────────────
@@ -343,13 +419,18 @@ async def chat_completions(raw_request: Request):
     if model_err:
         return JSONResponse(status_code=404, content={"error": {"message": model_err, "type": "invalid_request_error"}})
 
+    # messages 校验
+    messages = body.get("messages")
+    msg_err = _validate_messages(messages)
+    if msg_err:
+        return JSONResponse(status_code=400, content={"error": {"message": msg_err, "type": "invalid_request_error"}})
+
     is_stream = body.get("stream", False)
     payload = _build_upstream_payload(body, is_stream)
     model_name = payload["model"]
 
-    msgs = body.get("messages", [])
-    msg_count = len(msgs)
-    last_msg = str(msgs[-1].get("content", ""))[:100] if msgs else ""
+    msg_count = len(messages)
+    last_msg = str(messages[-1].get("content", ""))[:100] if messages else ""
     req_logger.info(f"  model={model_name} stream={is_stream} msgs={msg_count} last='{last_msg}'")
     logger.info(f"chat | model={model_name} | stream={is_stream} | msgs={msg_count}")
 
@@ -491,7 +572,7 @@ async def health():
 async def root():
     return {
         "service": "api-server",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "mode": "proxy",
         "upstream": UPSTREAM_BASE_URL,
         "default_model": UPSTREAM_DEFAULT_MODEL,
