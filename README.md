@@ -47,6 +47,7 @@ OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / openp
 | `retry_429_base` | — | 0.2 | 429 重试基础等待 (秒) |
 | `NO_TUNNEL` | `NO_TUNNEL` | 0 | 设为 1 不启动隧道 |
 | `NO_WATCHDOG` | `NO_WATCHDOG` | 0 | 设为 1 不启动看门狗 |
+| `max_input_chars` | — | 300000 | prompt 最大输入字符数 (上游限制 307200) |
 
 ## 模型别名
 
@@ -138,6 +139,24 @@ TokenHub 上游 API 限制 **4 req/s**，这是服务端硬限制。令牌桶限
 1. 环境变量 `os.environ.get()` — ~0ms
 2. 凭证文件 glob 匹配 — ~1ms
 3. `/proc/*/environ` 扫描 — ~50ms（兜底）
+
+### 7. 上游 prompt 字符数硬限制 307200
+
+TokenHub 上游 API 限制 prompt 最大 **307200 字符**（注意是字符数不是 token 数），超出返回错误：
+```
+Prompt length exceeds: the prompt length 310955 must less than the maximum input length 307200
+```
+
+解决方案：在发送上游前自动检测并截断，多级降级策略：
+1. **阈值判断用字符数**（与上游一致），安全阈值 300000（可配置 `max_input_chars`）
+2. **system 消息保护**：只截断内容（中间截断保留头尾），不整条删除 — system prompt 包含关键指令，删除会导致模型行为异常
+3. **非 system 旧消息**：从最早开始删除，保留最近上下文
+4. **兜底**：截断最后一条消息内容
+
+关键经验：
+- **字符数 ≠ token 数**：中文 ~1 token/字，ASCII ~1 token/4字。用 token 估算做阈值判断会导致漏判（310K ASCII chars ≈ 77.5K tokens，不触发截断但上游仍拒绝）。**必须用字符数做阈值判断**
+- **中间截断优于整条删除**：代码/文档的头尾通常最重要（文件头有 import/声明，尾有结论/return）
+- **响应头 `X-Prompt-Truncated: true`** 通知客户端发生了截断，避免客户端误以为上下文完整
 
 ## 参考
 
