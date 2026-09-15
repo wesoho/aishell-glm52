@@ -108,6 +108,9 @@ RETRY_429_BASE = _cfg("retry_429_base", 0.3, float)           # 基础等待
 
 MAX_BODY_SIZE = _cfg("max_body_size_mb", 10, int) * 1024 * 1024
 
+# 上游 prompt 最大输入长度 (TokenHub 限制 307200，留安全余量)
+MAX_INPUT_CHARS = _cfg("max_input_chars", 300000, int)
+
 LOG_FILE = _cfg("log_file", "/tmp/api-server.log")
 LOG_MAX_BYTES = _cfg("log_max_bytes_mb", 10, int) * 1024 * 1024
 LOG_BACKUP_COUNT = _cfg("log_backup_count", 5, int)
@@ -511,6 +514,148 @@ def _validate_messages(messages: list) -> Optional[str]:
     return None
 
 
+
+def _estimate_tokens(text: str) -> int:
+    """估算文本 token 数: 中文 ~1 token/字, ASCII ~1 token/4 chars。"""
+    if not text:
+        return 0
+    cjk = sum(1 for c in text if ord(c) > 127)
+    ascii_chars = len(text) - cjk
+    return cjk + ascii_chars // 4 + 1
+
+
+def _estimate_prompt_tokens(messages: list) -> int:
+    """估算 messages 总 token 数。"""
+    total = 0
+    for msg in messages:
+        c = msg.get("content", "")
+        if isinstance(c, str):
+            total += _estimate_tokens(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    total += _estimate_tokens(str(part.get("text", "")))
+        total += 4  # role + delimiter 开销
+    return total
+
+
+def _estimate_prompt_chars(messages: list) -> int:
+    """计算 messages 总字符数 (上游按字符数限制)。"""
+    total = 0
+    for msg in messages:
+        c = msg.get("content", "")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    total += len(str(part.get("text", "")))
+        total += 10  # role + JSON 结构开销
+    return total
+
+
+def _truncate_content_middle(content: str, max_tokens: int) -> str:
+    """中间截断: 保留头尾, 截掉中间。头尾各保留约 1/3 预算。"""
+    if _estimate_tokens(content) <= max_tokens:
+        return content
+    # 粗略按 token 比例转字符比例
+    head_budget = max_tokens // 3
+    tail_budget = max_tokens // 3
+    # 找到大致的字符切分点
+    head_chars = 0
+    head_tokens = 0
+    for i, c in enumerate(content):
+        head_tokens += 1 if ord(c) > 127 else 0.25
+        if head_tokens >= head_budget:
+            head_chars = i
+            break
+    tail_chars = 0
+    tail_tokens = 0
+    for i in range(len(content) - 1, -1, -1):
+        tail_tokens += 1 if ord(content[i]) > 127 else 0.25
+        if tail_tokens >= tail_budget:
+            tail_chars = len(content) - i
+            break
+    marker = "\n\n[...内容已截断...]\n\n"
+    return content[:head_chars] + marker + content[-tail_chars:]
+
+
+def _truncate_messages(messages: list, max_tokens: int) -> tuple:
+    """
+    智能截断 messages 以满足上游 token 限制。
+
+    策略 (优先级从高到低):
+    1. 始终保留最后一条消息 (用户当前请求)
+    2. system 消息不删除, 只截断其 content (中间截断)
+    3. 非最后、非 system 的消息从最早开始删除
+    4. 若仍超限, 截断最后一条消息的 content
+
+    返回 (截断后的 messages, 被裁剪的 token 数)。
+    """
+    total = _estimate_prompt_chars(messages)
+    if total <= max_tokens:
+        return messages, 0
+
+    original_total = total
+    msgs = [dict(m) for m in messages]  # shallow copy
+
+    # ── Step 1: 截断超长的单条 system 消息 (中间截断, 保留头尾) ──
+    for msg in msgs[:-1]:  # 不动最后一条
+        if msg.get("role") == "system":
+            c = msg.get("content", "")
+            if isinstance(c, str) and len(c) > max_tokens // 2:
+                # system 消息最多占一半预算
+                half = max_tokens // 2
+                head = c[:half // 3]
+                tail = c[-(half // 3):]
+                msg["content"] = head + "\n\n[...内容已截断...]\n\n" + tail
+
+    total = _estimate_prompt_chars(msgs)
+    if total <= max_tokens:
+        return msgs, original_total - total
+
+    # ── Step 2: 从最早的非 system 消息开始删除 (保留最后一条) ──
+    last_msg = msgs[-1]
+    system_msgs = [m for m in msgs[:-1] if m.get("role") == "system"]
+    other_msgs = [m for m in msgs[:-1] if m.get("role") != "system"]
+
+    # 逐步删除 other_msgs 中最早的
+    while other_msgs and _estimate_prompt_chars(system_msgs + other_msgs + [last_msg]) > max_tokens:
+        other_msgs.pop(0)
+
+    msgs = system_msgs + other_msgs + [last_msg]
+    total = _estimate_prompt_chars(msgs)
+    if total <= max_tokens:
+        return msgs, original_total - total
+
+    # ── Step 3: 进一步截断 system 消息内容 ──
+    budget_for_system = max_tokens - _estimate_prompt_chars(other_msgs + [last_msg])
+    if budget_for_system > 0 and system_msgs:
+        per_sys = budget_for_system // len(system_msgs)
+        for msg in system_msgs:
+            c = msg.get("content", "")
+            if isinstance(c, str) and len(c) > per_sys:
+                head = c[:per_sys // 3]
+                tail = c[-(per_sys // 3):]
+                msg["content"] = head + "\n\n[...内容已截断...]\n\n" + tail
+
+    msgs = system_msgs + other_msgs + [last_msg]
+    total = _estimate_prompt_chars(msgs)
+    if total <= max_tokens:
+        return msgs, original_total - total
+
+    # ── Step 4: 最后兜底 — 截断最后一条消息 ──
+    c = last_msg.get("content", "")
+    if isinstance(c, str):
+        remaining = max_tokens - _estimate_prompt_chars(system_msgs + other_msgs)
+        if remaining > 100:
+            last_msg["content"] = c[:remaining - 50] + "\n\n[...内容已截断...]"
+
+    msgs = system_msgs + other_msgs + [last_msg]
+    final_total = _estimate_prompt_chars(msgs)
+    return msgs, original_total - final_total
+
+
 def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
     payload = {
         "model": _resolve_model(body.get("model", "default")),
@@ -783,6 +928,20 @@ async def chat_completions(raw_request: Request):
         return _openai_error(msg_err, 400, "invalid_request_error")
 
     is_stream = body.get("stream", False)
+
+    # ── prompt 长度检查与自动截断 ──
+    # 上游 TokenHub 按字符数限制 (307200), 用字符数做阈值判断
+    total_chars = _estimate_prompt_chars(messages)
+    was_truncated = False
+    if total_chars > MAX_INPUT_CHARS:
+        truncated, removed = _truncate_messages(messages, MAX_INPUT_CHARS)
+        body = dict(body)
+        body["messages"] = truncated
+        after_chars = _estimate_prompt_chars(truncated)
+        was_truncated = True
+        logger.warning(f"[{request_id}] prompt truncated: {total_chars} -> {after_chars} chars (removed {removed})")
+        req_logger.info(f"[{request_id}]   TRUNCATED prompt {total_chars}->{after_chars} msgs {len(messages)}->{len(truncated)}")
+        messages = truncated
     payload = _build_upstream_payload(body, is_stream)
     model_name = payload["model"]
 
@@ -794,7 +953,11 @@ async def chat_completions(raw_request: Request):
     if is_stream:
         _metrics["stream_requests"] += 1
         gen = await call_upstream_chat(payload, stream=True, request_id=request_id)
-        return StreamingResponse(gen, media_type="text/event-stream", headers=SSE_HEADERS)
+        stream_headers = dict(SSE_HEADERS)
+        stream_headers["x-request-id"] = request_id
+        if was_truncated:
+            stream_headers["x-prompt-truncated"] = "true"
+        return StreamingResponse(gen, media_type="text/event-stream", headers=stream_headers)
     else:
         result = await call_upstream_chat(payload, stream=False, request_id=request_id)
         if isinstance(result, dict) and result.get("error"):
@@ -802,7 +965,10 @@ async def chat_completions(raw_request: Request):
         result = _strip_reasoning(result)
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         logger.info(f"[{request_id}] chat done | model={model_name} | content_len={len(content)} | content={content[:200]}")
-        return JSONResponse(content=result)
+        resp_headers = {"x-request-id": request_id}
+        if was_truncated:
+            resp_headers["x-prompt-truncated"] = "true"
+        return JSONResponse(content=result, headers=resp_headers)
 
 
 @app.post("/v1/completions")
