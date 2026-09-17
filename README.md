@@ -1,12 +1,12 @@
 # aishell-glm52
 
-OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / openpangu-2.0-flash)。
+OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / DeepSeek-V4)。
 
 ## 特性
 
 - ✅ 完整 OpenAI API 兼容 (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/embeddings`)
 - ✅ 流式 SSE 严格对齐 OpenAI 格式 (chatcmpl- ID, role/content 分离, finish_reason, usage)
-- ✅ 模型别名映射 (`gpt-4` → `glm-5.2`, `gpt-3.5-turbo` → `openpangu-2.0-flash` 等)
+- ✅ 模型别名映射 (`gpt-4` → `glm-5.2`, `gpt-3.5-turbo` → `deepseek-v4-flash-0731` 等)
 - ✅ 上游错误自动重试 (指数退避, 5xx/429/连接错误)
 - ✅ **令牌桶限速器** — 控制发往上游的请求速率，避免 429
 - ✅ **全局 429 熔断冷却** — 收到 429 后所有请求暂停，避免连续触发限速
@@ -53,11 +53,11 @@ OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / openp
 
 | 客户端模型名 | 实际上游模型 |
 |------------|------------|
-| `default` | openpangu-2.0-flash |
+| `default` | deepseek-v4-flash-0731 |
 | `gpt-4` / `gpt-4o` / `gpt-4-turbo` | glm-5.2 |
-| `gpt-3.5-turbo` / `gpt-3.5` | openpangu-2.0-flash |
+| `gpt-3.5-turbo` / `gpt-3.5` | deepseek-v4-flash-0731 |
 | `claude-3-opus` / `claude-3-sonnet` | glm-5.2 |
-| `glm-5.2` / `glm-5.1` / `openpangu-2.0-flash` | 原样传递 |
+| `glm-5.2` / `glm-5.1` / `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` | 原样传递 |
 
 ## API 端点
 

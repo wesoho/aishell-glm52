@@ -449,7 +449,7 @@ print_usage() {
     echo -e "${CYAN}${BOLD}🖥️  Cursor / VS Code 配置${NC}"
     echo -e "   ${GREEN}API Base URL:${NC}  ${PUBLIC_URL}/v1"
     echo -e "   ${GREEN}API Key:${NC}       any (不校验)"
-    echo -e "   ${GREEN}Model:${NC}          default / gpt-4 / glm-5.2"
+    echo -e "   ${GREEN}Model:${NC}          default / gpt-4 / glm-5.2 / deepseek-v4-flash-0731"
     echo ""
     echo -e "${CYAN}${BOLD}⚙️  服务管理${NC}"
     echo -e "   ${YELLOW}./start.sh status${NC}    查看运行状态"

@@ -1,6 +1,6 @@
 """
 OpenAI 兼容 API 代理服务 (v3.1)
-代理到华为云内置模型 (GLM-5.2 / openpangu-2.0-flash)
+代理到华为云内置模型 (GLM-5.2 / DeepSeek-V4)
 
 特色:
 - 完整 OpenAI API 兼容 (chat3, completions, models, embeddings)
@@ -73,16 +73,16 @@ def _cfg(key: str, default=None, cast=str):
 
 UPSTREAM_BASE_URL = _cfg("upstream_base_url", "https://tokenhub.developer.huaweicloud.com/v2")
 UPSTREAM_API_KEY = os.environ.get("JOB_ENV_MODEL_API_KEY", "")
-UPSTREAM_DEFAULT_MODEL = _cfg("upstream_default_model", "openpangu-2.0-flash")
-UPSTREAM_MODELS: list = _config.get("upstream_models", ["openpangu-2.0-flash", "glm-5.2", "glm-5.1"])
+UPSTREAM_DEFAULT_MODEL = _cfg("upstream_default_model", "deepseek-v4-flash-0731")
+UPSTREAM_MODELS: list = _config.get("upstream_models", ["glm-5.2", "glm-5.1", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813"])
 
 MODEL_ALIASES: Dict[str, str] = _config.get("model_aliases", {
     "default": UPSTREAM_DEFAULT_MODEL,
     "gpt-4": "glm-5.2",
     "gpt-4o": "glm-5.2",
     "gpt-4-turbo": "glm-5.2",
-    "gpt-3.5-turbo": "openpangu-2.0-flash",
-    "gpt-3.5": "openpangu-2.0-flash",
+    "gpt-3.5-turbo": "deepseek-v4-flash-0731",
+    "gpt-3.5": "deepseek-v4-flash-0731",
     "claude-3-opus": "glm-5.2",
     "claude-3-sonnet": "glm-5.2",
 })
