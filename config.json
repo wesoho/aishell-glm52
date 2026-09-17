@@ -1,38 +1,26 @@
 {
-    "upstream_base_url": "https://tokenhub.developer.huaweicloud.com/v2",
-    "upstream_default_model": "deepseek-v4-flash-0731",
-    "upstream_models": [
-        "glm-5.2",
-        "glm-5.1",
-        "deepseek-v4-flash-0731",
-        "deepseek-v4-pro-0813"
-    ],
-    "model_aliases": {
-        "default": "deepseek-v4-flash-0731",
-        "gpt-4": "glm-5.2",
-        "gpt-4o": "glm-5.2",
-        "gpt-4-turbo": "glm-5.2",
-        "gpt-3.5-turbo": "deepseek-v4-flash-0731",
-        "gpt-3.5": "deepseek-v4-flash-0731",
-        "claude-3-opus": "glm-5.2",
-        "claude-3-sonnet": "glm-5.2"
-    },
-    "default_max_tokens": 4096,
-    "connect_timeout": 10,
-    "read_timeout": 300,
-    "write_timeout": 300,
-    "max_retries": 2,
-    "retry_backoff": 0.5,
-    "max_concurrent": 20,
-    "max_body_size_mb": 10,
-    "log_file": "/tmp/api-server.log",
-    "log_max_bytes_mb": 10,
-    "log_backup_count": 5,
-    "api_port": 8080,
-    "upstream_health_interval": 60,
-    "upstream_model_refresh_interval": 300,
-    "upstream_rate_limit": 3.0,
-    "upstream_rate_burst": 2,
-    "retry_429_max": 10,
-    "retry_429_base": 0.2
+  "upstream_base_url": "https://tokenhub.developer.huaweicloud.com/v2",
+  "upstream_default_model": "deepseek-v4-flash-0731",
+  "upstream_models": ["glm-5.2", "glm-5.1", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813"],
+  "model_aliases": {
+    "default": "deepseek-v4-flash-0731",
+    "gpt-3.5-turbo": "deepseek-v4-flash-0731",
+    "gpt-3.5": "deepseek-v4-flash-0731",
+    "gpt-4": "glm-5.2",
+    "gpt-4o": "glm-5.2",
+    "gpt-4-turbo": "glm-5.2",
+    "claude-3-opus": "glm-5.2",
+    "claude-3-sonnet": "glm-5.2"
+  },
+  "snap_access": {
+    "base_url": "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2",
+    "region": "cn-north-4",
+    "models": [
+      "openpangu-2.0-flash",
+      "openpangu-2.0-pro",
+      "glm-5.2-sft-harmony",
+      "qwen-vl-max",
+      "qwen-vl-plus"
+    ]
+  }
 }

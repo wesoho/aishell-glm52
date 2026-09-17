@@ -227,10 +227,49 @@ inject_api_key() {
     fi
 }
 
+# ── 注入 Snap Access AK/SK ──
+inject_ak_sk() {
+    # 从环境变量或凭证文件查找华为云 AK/SK (用于 Snap Access V4 签名)
+    if [ -n "${HW_ACCESS_KEY:-}" ] && [ -n "${HW_SECRET_KEY:-}" ]; then
+        print_success "Snap Access AK/SK 已在环境变量中"
+        return
+    fi
+    # 从凭证文件查找
+    for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml; do
+        if [ -f "$credfile" ]; then
+            _ak=$(grep -oP '(?:HW_ACCESS_KEY|access_key)\s*[:=]\s*"?\K[A-Za-z0-9]{10,}' "$credfile" 2>/dev/null | head -1)
+            _sk=$(grep -oP '(?:HW_SECRET_KEY|secret_key)\s*[:=]\s*"?\K[A-Za-z0-9]{30,}' "$credfile" 2>/dev/null | head -1)
+            if [ -n "$_ak" ] && [ -n "$_sk" ]; then
+                export HW_ACCESS_KEY="$_ak"
+                export HW_SECRET_KEY="$_sk"
+                _st=$(grep -oP '(?:HW_SECURITY_TOKEN|security_token)\s*[:=]\s*"?\K[A-Za-z0-9.+=/-]{20,}' "$credfile" 2>/dev/null | head -1)
+                [ -n "$_st" ] && export HW_SECURITY_TOKEN="$_st"
+                print_success "从凭证文件注入 Snap Access AK/SK"
+                return
+            fi
+        fi
+    done
+    # 从 /proc 查找
+    for pid in $(ls /proc 2>/dev/null | grep '^[0-9]*$' | head -50); do
+        _ak=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep '^HW_ACCESS_KEY=' | head -1 | cut -d= -f2-)
+        _sk=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep '^HW_SECRET_KEY=' | head -1 | cut -d= -f2-)
+        if [ -n "$_ak" ] && [ -n "$_sk" ]; then
+            export HW_ACCESS_KEY="$_ak"
+            export HW_SECRET_KEY="$_sk"
+            _st=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep '^HW_SECURITY_TOKEN=' | head -1 | cut -d= -f2-)
+            [ -n "$_st" ] && export HW_SECURITY_TOKEN="$_st"
+            print_success "从 /proc/$pid 注入 Snap Access AK/SK"
+            return
+        fi
+    done
+    print_warn "未找到 Snap Access AK/SK，Snap Access 模型将不可用 (TokenHub 模型正常)"
+}
+
 # ── 启动 API 服务 ──
 start_api() {
     print_step "启动 API 服务 (端口 ${API_PORT})"
     inject_api_key
+    inject_ak_sk
 
     cd "${SCRIPT_DIR}"
     API_PORT="${API_PORT}" setsid python3 main.py > "${API_LOG}" 2>&1 &
@@ -501,9 +540,9 @@ fi
 
 # 步骤 1: 安装 Python 依赖
 print_step "步骤 1/3: 安装 Python 依赖"
-if ! python3 -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
+if ! python3 -c "import fastapi, uvicorn, httpx, huaweicloudsdkcore" 2>/dev/null; then
     print_info "安装 FastAPI + Uvicorn..."
-    pip install -q fastapi uvicorn pydantic httpx 2>&1 | tail -5
+    pip install -q fastapi uvicorn pydantic httpx huaweicloudsdkcore 2>&1 | tail -5
 else
     print_success "Python 依赖已就绪"
 fi

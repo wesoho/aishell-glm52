@@ -1,5 +1,6 @@
 """
-OpenAI 兼容 API 代理服务 (v3.1)
+OpenAI 兼容 API 代理服务 (v3.2)
+双上游: TokenHub (Bearer) + Snap Access (V4 HMAC 签名)
 代理到华为云内置模型 (GLM-5.2 / DeepSeek-V4)
 
 特色:
@@ -37,6 +38,9 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
+from urllib.parse import urlparse
+from huaweicloudsdkcore.auth.credentials import BasicCredentials
+from huaweicloudsdkcore.sdk_request import SdkRequest
 
 # ──────────────────────────────────────────────
 # 配置加载: config.json → 环境变量覆盖
@@ -88,6 +92,22 @@ MODEL_ALIASES: Dict[str, str] = _config.get("model_aliases", {
 })
 
 ALL_MODELS = list(MODEL_ALIASES.keys()) + UPSTREAM_MODELS
+
+# ── Snap Access 配置 (华为云 V4 HMAC 签名认证的第二个上游) ──
+_snap_cfg = _config.get("snap_access", {})
+SNAP_ACCESS_BASE_URL = _snap_cfg.get("base_url", "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2")
+SNAP_ACCESS_REGION = _snap_cfg.get("region", "cn-north-4")
+SNAP_ACCESS_MODELS: list = _snap_cfg.get("models", [
+    "openpangu-2.0-flash",
+    "openpangu-2.0-pro",
+    "glm-5.2-sft-harmony",
+    "qwen-vl-max",
+    "qwen-vl-plus",
+])
+SNAP_ACCESS_AK = os.environ.get("HW_ACCESS_KEY", "")
+SNAP_ACCESS_SK = os.environ.get("HW_SECRET_KEY", "")
+SNAP_ACCESS_SECURITY_TOKEN = os.environ.get("HW_SECURITY_TOKEN", "")
+SNAP_ACCESS_ENABLED = bool(SNAP_ACCESS_AK and SNAP_ACCESS_SK)
 DEFAULT_MAX_TOKENS = _cfg("default_max_tokens", 4096, int)
 
 CONNECT_TIMEOUT = _cfg("connect_timeout", 10, float)
@@ -221,6 +241,7 @@ req_logger.addHandler(_rfh)
 logger.info(f"Upstream: {UPSTREAM_BASE_URL}")
 logger.info(f"Default model: {UPSTREAM_DEFAULT_MODEL}")
 logger.info(f"API key configured: {'yes' if UPSTREAM_API_KEY else 'no'}")
+logger.info(f"Snap Access: {'enabled' if SNAP_ACCESS_ENABLED else 'disabled'}, models={SNAP_ACCESS_MODELS}")
 logger.info(f"Max concurrent: {MAX_CONCURRENT}, Max retries: {MAX_RETRIES}")
 logger.info(f"Rate limit: {UPSTREAM_RATE_LIMIT}/s (burst={UPSTREAM_RATE_BURST}), 429 retry: {RETRY_429_MAX}")
 logger.info(f"Max body size: {MAX_BODY_SIZE // 1024 // 1024}MB, Log rotation: {LOG_MAX_BYTES // 1024 // 1024}MBx{LOG_BACKUP_COUNT}")
@@ -492,11 +513,12 @@ def _get_all_models() -> list:
     models = set(MODEL_ALIASES.keys())
     models.update(UPSTREAM_MODELS)
     models.update(_upstream_models_dynamic)
+    models.update(SNAP_ACCESS_MODELS)
     return sorted(models)
 
 
 def _validate_model(model: str) -> Optional[str]:
-    if not model or model in MODEL_ALIASES or model in UPSTREAM_MODELS or model in _upstream_models_dynamic:
+    if not model or model in MODEL_ALIASES or model in UPSTREAM_MODELS or model in _upstream_models_dynamic or model in SNAP_ACCESS_MODELS:
         return None
     return f"The model '{model}' does not exist. Available models: {', '.join(_get_all_models())}"
 
@@ -718,9 +740,10 @@ def _should_retry(status_code: int) -> bool:
 # ──────────────────────────────────────────────
 
 def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
-    if not line.startswith("data: "):
+    # 兼容两种 SSE 格式: TokenHub "data: {...}" 和 Snap Access "data:{...}"
+    if not line.startswith("data:"):
         return None
-    data_str = line[6:].strip()
+    data_str = line[5:].strip()
     if data_str == "[DONE]":
         state["done_sent"] = True
         if not state.get("finish_sent"):
@@ -798,13 +821,52 @@ SSE_HEADERS = {
 # 上游调用
 # ──────────────────────────────────────────────
 
+def _is_snap_access_model(model: str) -> bool:
+    """判断模型是否走 Snap Access 上游"""
+    return model in SNAP_ACCESS_MODELS
+
+
+def _build_snap_headers(method: str, url: str, body_str: str) -> dict:
+    """构建华为云 V4 HMAC 签名请求头 (Snap Access 认证)"""
+    if not SNAP_ACCESS_ENABLED:
+        return {"Content-Type": "application/json"}
+
+    parsed = urlparse(url)
+    req = SdkRequest(
+        method=method,
+        schema=parsed.scheme,
+        host=parsed.netloc,
+        resource_path=parsed.path,
+        uri=parsed.query or "",
+        query_params=[],
+        header_params={"Content-Type": "application/json"},
+        body=body_str,
+        stream=False,
+    )
+    creds = BasicCredentials(ak=SNAP_ACCESS_AK, sk=SNAP_ACCESS_SK)
+    if SNAP_ACCESS_SECURITY_TOKEN:
+        creds.security_token = SNAP_ACCESS_SECURITY_TOKEN
+    creds.sign_request(req)
+    return req.header_params
+
+
 def _upstream_headers():
     return {"Content-Type": "application/json", "Authorization": f"Bearer {UPSTREAM_API_KEY}"}
 
 
 async def call_upstream_chat(payload: dict, stream: bool = False, request_id: str = ""):
-    url = f"{UPSTREAM_BASE_URL}/chat/completions"
-    headers = _upstream_headers()
+    model = payload.get("model", "")
+    use_snap = _is_snap_access_model(model)
+    if use_snap:
+        url = f"{SNAP_ACCESS_BASE_URL}/chat/completions"
+        body_str = json.dumps(payload, ensure_ascii=False)
+        headers = _build_snap_headers("POST", url, body_str)
+        req_kw = {"content": body_str}
+        logger.debug(f"[{request_id}] snap-access route: model={model}")
+    else:
+        url = f"{UPSTREAM_BASE_URL}/chat/completions"
+        headers = _upstream_headers()
+        req_kw = {"json": payload}
     client = await get_client()
 
     if stream:
@@ -817,7 +879,7 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
                     await _wait_cooldown()
                     await get_rate_limiter().acquire()
                     async with get_semaphore():
-                        async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                        async with client.stream("POST", url, headers=headers, **req_kw) as resp:
                             if resp.status_code != 200:
                                 body = await resp.aread()
                                 err_text = body.decode("utf-8", errors="replace")[:500]
@@ -877,7 +939,7 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
                 await _wait_cooldown()
                 await get_rate_limiter().acquire()
                 async with get_semaphore():
-                    resp = await client.post(url, json=payload, headers=headers)
+                    resp = await client.post(url, headers=headers, **req_kw)
                 if resp.status_code == 200:
                     data = resp.json()
                     _record_usage(data.get("usage", {}))
@@ -1025,6 +1087,9 @@ async def list_models():
     for model_id in _upstream_models_dynamic:
         if model_id not in UPSTREAM_MODELS and model_id not in MODEL_ALIASES:
             data.append({"id": model_id, "object": "model", "created": now, "owned_by": "huawei-cloud-dynamic"})
+    for model_id in SNAP_ACCESS_MODELS:
+        if model_id not in UPSTREAM_MODELS and model_id not in MODEL_ALIASES:
+            data.append({"id": model_id, "object": "model", "created": now, "owned_by": "huawei-cloud-snap-access"})
     return {"object": "list", "data": data}
 
 
@@ -1091,7 +1156,9 @@ async def health():
         "upstream": UPSTREAM_BASE_URL,
         "model": UPSTREAM_DEFAULT_MODEL,
         "api_key_configured": bool(UPSTREAM_API_KEY),
-        "version": "3.1.0",
+        "snap_access_enabled": SNAP_ACCESS_ENABLED,
+        "snap_access_models": SNAP_ACCESS_MODELS,
+        "version": "3.2.0",
     }
 
 
@@ -1126,8 +1193,10 @@ async def metrics():
 @app.get("/")
 async def root():
     return {
-        "service": "api-server", "version": "3.1.0", "mode": "proxy",
+        "service": "api-server", "version": "3.2.0", "mode": "proxy",
         "upstream": UPSTREAM_BASE_URL, "default_model": UPSTREAM_DEFAULT_MODEL,
+        "snap_access_upstream": SNAP_ACCESS_BASE_URL,
+        "snap_access_enabled": SNAP_ACCESS_ENABLED,
         "available_models": _get_all_models(),
         "model_aliases": MODEL_ALIASES,
         "endpoints": {
@@ -1145,5 +1214,5 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting on port {API_PORT}, upstream={UPSTREAM_BASE_URL}, model={UPSTREAM_DEFAULT_MODEL}")
+    logger.info(f"Starting on port {API_PORT}, upstream={UPSTREAM_BASE_URL}, model={UPSTREAM_DEFAULT_MODEL}, snap_access={'on' if SNAP_ACCESS_ENABLED else 'off'}")
     uvicorn.run(app, host="0.0.0.0", port=API_PORT, log_level="info", access_log=False, timeout_keep_alive=30)

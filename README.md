@@ -1,11 +1,13 @@
 # aishell-glm52
 
-OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / DeepSeek-V4)。
+OpenAI 兼容 API 代理服务，双上游代理到华为云模型 (TokenHub + Snap Access)。
 
 ## 特性
 
 - ✅ 完整 OpenAI API 兼容 (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/embeddings`)
+- ✅ **双上游路由** — TokenHub (Bearer token) + Snap Access (V4 HMAC 签名)，按模型名自动路由
 - ✅ 流式 SSE 严格对齐 OpenAI 格式 (chatcmpl- ID, role/content 分离, finish_reason, usage)
+- ✅ 兼容两种 SSE 格式 (TokenHub `data: {...}` 和 Snap Access `data:{...}`)
 - ✅ 模型别名映射 (`gpt-4` → `glm-5.2`, `gpt-3.5-turbo` → `deepseek-v4-flash-0731` 等)
 - ✅ 上游错误自动重试 (指数退避, 5xx/429/连接错误)
 - ✅ **令牌桶限速器** — 控制发往上游的请求速率，避免 429
@@ -18,6 +20,25 @@ OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / DeepS
 - ✅ **保活看门狗** — API/隧道挂掉自动恢复 (每 30s 检查)
 - ✅ tool_calls / function calling 支持
 - ✅ 所有额外参数透传 (stream_options, response_format, tools, ...)
+
+## 双上游架构
+
+```
+客户端请求
+    │
+    ├─ model = glm-5.2 / deepseek-v4-* → TokenHub (Bearer token)
+    │                                      tokenhub.developer.huaweicloud.com/v2
+    │
+    └─ model = openpangu-* / qwen-vl-*  → Snap Access (V4 HMAC 签名)
+                                           snap-access.cn-north-4.myhuaweicloud.com/api/v2
+```
+
+| 上游 | 认证方式 | 模型 |
+|------|---------|------|
+| TokenHub | Bearer token (`JOB_ENV_MODEL_API_KEY`) | glm-5.2, glm-5.1, deepseek-v4-flash-0731, deepseek-v4-pro-0813 |
+| Snap Access | 华为云 V4 HMAC 签名 (AK/SK) | openpangu-2.0-flash, openpangu-2.0-pro, glm-5.2-sft-harmony, qwen-vl-max, qwen-vl-plus |
+
+Snap Access 使用华为云标准 V4 HMAC 签名认证（非 Bearer token），通过 `huaweicloudsdkcore` SDK 完成签名，每个请求动态生成 `Authorization: SDK-HMAC-SHA256 ...` 头。
 
 ## 快速开始
 
@@ -49,7 +70,33 @@ OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / DeepS
 | `NO_WATCHDOG` | `NO_WATCHDOG` | 0 | 设为 1 不启动看门狗 |
 | `max_input_chars` | — | 300000 | prompt 最大输入字符数 (上游限制 307200) |
 
-## 模型别名
+### Snap Access 配置
+
+在 `config.json` 的 `snap_access` 段配置：
+
+```json
+{
+  "snap_access": {
+    "base_url": "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2",
+    "region": "cn-north-4",
+    "models": ["openpangu-2.0-flash", "openpangu-2.0-pro", "glm-5.2-sft-harmony", "qwen-vl-max", "qwen-vl-plus"]
+  }
+}
+```
+
+AK/SK 通过环境变量传入（`start.sh` 会自动从凭证文件注入）：
+
+| 环境变量 | 说明 |
+|---------|------|
+| `HW_ACCESS_KEY` | 华为云 AK (Access Key) |
+| `HW_SECRET_KEY` | 华为云 SK (Secret Key) |
+| `HW_SECURITY_TOKEN` | 安全令牌 (临时凭证时需要，永久 AK/SK 可不设) |
+
+> 未配置 AK/SK 时，Snap Access 模型不可用，TokenHub 模型正常工作。
+
+## 模型列表
+
+### TokenHub 模型 (Bearer token 认证)
 
 | 客户端模型名 | 实际上游模型 |
 |------------|------------|
@@ -59,15 +106,25 @@ OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / DeepS
 | `claude-3-opus` / `claude-3-sonnet` | glm-5.2 |
 | `glm-5.2` / `glm-5.1` / `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` | 原样传递 |
 
+### Snap Access 模型 (V4 HMAC 签名认证)
+
+| 模型名 | 说明 |
+|-------|------|
+| `openpangu-2.0-flash` | 盘古 flash 模型 (快速) |
+| `openpangu-2.0-pro` | 盘古 pro 模型 (高质量) |
+| `glm-5.2-sft-harmony` | GLM-5.2 SFT 调和版 |
+| `qwen-vl-max` | 通义千问 VL 多模态 (最强) |
+| `qwen-vl-plus` | 通义千问 VL 多模态 (标准) |
+
 ## API 端点
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/v1/chat/completions` | OpenAI 聊天 (支持 stream) |
 | POST | `/v1/completions` | OpenAI 文本补全 |
-| GET | `/v1/models` | 模型列表 |
+| GET | `/v1/models` | 模型列表 (含双上游所有模型) |
 | POST | `/v1/embeddings` | 向量嵌入 |
-| GET | `/health` | 健康检查 |
+| GET | `/health` | 健康检查 (含双上游状态) |
 | GET | `/metrics` | 运行指标 |
 | POST | `/process` | 通用处理 |
 | GET | `/docs` | Swagger 文档 |
@@ -82,18 +139,13 @@ OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / DeepS
                 └──── 429 熔断冷却 1s ←── 429 响应 ──┘
 ```
 
-| 场景 | 无限速 | 有限速 |
-|------|--------|--------|
-| 10 并发 | 80% 成功 | **100% 成功** |
-| 20 并发 | ~50% 成功 | **75% 成功** |
-
-> 20 并发时的失败是上游硬限速导致，无法完全避免。可通过降低 `upstream_rate_limit` 进一步减少失败率，代价是总耗时增加。
+> 注意：令牌桶限速仅对 TokenHub 上游有意义。Snap Access 上游使用独立的 AK/SK 认证，限速策略可能不同。
 
 ## 保活看门狗
 
 `start.sh` 内置看门狗，每 30 秒检查一次：
 
-- API 服务挂了 → 自动重启 (含 API Key 重新注入)
+- API 服务挂了 → 自动重启 (含 API Key + AK/SK 重新注入)
 - Cloudflare 隧道挂了 → 自动重建并更新 URL
 - 看门狗自身作为独立脚本运行，不受主脚本退出影响
 
@@ -102,7 +154,7 @@ OpenAI 兼容 API 代理服务，代理到华为云内置模型 (GLM-5.2 / DeepS
 ```
 API Base URL: https://<tunnel>.trycloudflare.com/v1
 API Key:      any (不校验)
-Model:        gpt-4 (或 glm-5.2, default)
+Model:        gpt-4 (或 glm-5.2, default, openpangu-2.0-flash 等)
 ```
 
 ## 经验教训
@@ -127,38 +179,30 @@ bash 子脚本会继承父脚本的 `set -euo pipefail`，导致看门狗在任�
 
 ### 4. 上游硬限速不可绕过
 
-TokenHub 上游 API 限制 **4 req/s**，这是服务端硬限制。令牌桶限速器只能**避免不必要的 429**（客户端侧排队），不能突破上游上限。20 并发时仍有约 25% 失败是上游瓶颈，只能通过降低并发或降低 `upstream_rate_limit` 来缓解。
+TokenHub 上游 API 限制 **4 req/s**，这是服务端硬限制。令牌桶限速器只能**避免不必要的 429**（客户端侧排队），不能突破上游上限。
 
-### 5. `exec -a bash -c` 嵌套子壳丢失 PATH
+### 5. Snap Access V4 HMAC 签名
 
-使用 `exec -a bash -c` 创建命名子进程时，嵌套子壳内 PATH 会丢失，导致找不到 `python3`、`curl` 等可执行文件。解决方案：写独立 shell 脚本，开头显式 `export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"`。
+Snap Access 端点不接受 Bearer token，需要华为云标准 V4 HMAC 签名（`SDK-HMAC-SHA256`）。关键点：
+- 使用 `huaweicloudsdkcore` SDK 的 `BasicCredentials` + `SdkRequest` + `Signer` 完成签名
+- 签名时 body 必须与实际发送的 body **完全一致**（字节级），因此预序列化 body 后用 `content=` 发送，而非 `json=`
+- `SdkRequest` 构造需要拆分 URL 为 `schema` / `host` / `resource_path` / `uri` 参数
+- 临时凭证需额外设置 `security_token`，SDK 会自动添加 `X-Security-Token` 头
 
-### 6. API Key 多策略快速获取
+### 6. SSE 格式差异
 
-原始方案扫描 `/proc/*/environ`（~50ms，且不稳定）。优化为三级策略：
-1. 环境变量 `os.environ.get()` — ~0ms
-2. 凭证文件 glob 匹配 — ~1ms
-3. `/proc/*/environ` 扫描 — ~50ms（兜底）
+TokenHub 和 Snap Access 的 SSE 格式有细微差异：
+- TokenHub: `data: {...}` (data 后有空格)
+- Snap Access: `data:{...}` (data 后无空格)
+
+代理服务统一处理两种格式，`line[5:].strip()` 兼容两种写法。
 
 ### 7. 上游 prompt 字符数硬限制 307200
 
-TokenHub 上游 API 限制 prompt 最大 **307200 字符**（注意是字符数不是 token 数），超出返回错误：
-```
-Prompt length exceeds: the prompt length 310955 must less than the maximum input length 307200
-```
-
-解决方案：在发送上游前自动检测并截断，多级降级策略：
-1. **阈值判断用字符数**（与上游一致），安全阈值 300000（可配置 `max_input_chars`）
-2. **system 消息保护**：只截断内容（中间截断保留头尾），不整条删除 — system prompt 包含关键指令，删除会导致模型行为异常
-3. **非 system 旧消息**：从最早开始删除，保留最近上下文
-4. **兜底**：截断最后一条消息内容
-
-关键经验：
-- **字符数 ≠ token 数**：中文 ~1 token/字，ASCII ~1 token/4字。用 token 估算做阈值判断会导致漏判（310K ASCII chars ≈ 77.5K tokens，不触发截断但上游仍拒绝）。**必须用字符数做阈值判断**
-- **中间截断优于整条删除**：代码/文档的头尾通常最重要（文件头有 import/声明，尾有结论/return）
-- **响应头 `X-Prompt-Truncated: true`** 通知客户端发生了截断，避免客户端误以为上下文完整
+TokenHub 上游 API 限制 prompt 最大 **307200 字符**（注意是字符数不是 token 数），超出返回错误。解决方案：在发送上游前自动检测并截断，安全阈值 300000（可配置 `max_input_chars`）。
 
 ## 参考
 
 - [one-api](https://github.com/songquanpeng/one-api) - SSE headers, pass-through streaming
 - [LiteLLM](https://github.com/BerriAI/litellm) - Model aliasing, retry logic
+- [huaweicloudsdkcore](https://github.com/huaweicloud/huaweicloud-sdk-python-v3) - V4 HMAC 签名
