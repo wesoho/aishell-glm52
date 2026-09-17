@@ -29,16 +29,27 @@ OpenAI 兼容 API 代理服务，双上游代理到华为云模型 (TokenHub + S
     ├─ model = glm-5.2 / deepseek-v4-* → TokenHub (Bearer token)
     │                                      tokenhub.developer.huaweicloud.com/v2
     │
-    └─ model = openpangu-* / qwen-vl-*  → Snap Access (V4 HMAC 签名)
+    └─ model = openpangu-* / glm-5.2-sft-harmony → Snap Access (V4 HMAC 签名)
                                            snap-access.cn-north-4.myhuaweicloud.com/api/v2
 ```
 
 | 上游 | 认证方式 | 模型 |
 |------|---------|------|
 | TokenHub | Bearer token (`JOB_ENV_MODEL_API_KEY`) | glm-5.2, glm-5.1, deepseek-v4-flash-0731, deepseek-v4-pro-0813 |
-| Snap Access | 华为云 V4 HMAC 签名 (AK/SK) | openpangu-2.0-flash, openpangu-2.0-pro, glm-5.2-sft-harmony, qwen-vl-max, qwen-vl-plus |
+| Snap Access | 华为云 V4 HMAC 签名 (AK/SK) | openpangu-2.0-flash, openpangu-2.0-pro, glm-5.2-sft-harmony |
 
 Snap Access 使用华为云标准 V4 HMAC 签名认证（非 Bearer token），通过 `huaweicloudsdkcore` SDK 完成签名，每个请求动态生成 `Authorization: SDK-HMAC-SHA256 ...` 头。
+
+## 快速安装（一条命令装好，全部模型可用）
+
+```bash
+git clone https://github.com/wesoho/aishell-glm52.git
+cd aishell-glm52
+bash install.sh          # 自动装依赖 + cloudflared + 注入 AK/SK + 启动
+```
+
+> 安装脚本会自动跳过已装部分（幂等），依赖安装与 cloudflared 下载并行执行。
+> 华为云平台沙箱内运行时，AK/SK 由平台注入（`JOB_ENV_HW_*`），脚本自动映射。
 
 ## 快速开始
 
@@ -79,7 +90,7 @@ Snap Access 使用华为云标准 V4 HMAC 签名认证（非 Bearer token），�
   "snap_access": {
     "base_url": "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2",
     "region": "cn-north-4",
-    "models": ["openpangu-2.0-flash", "openpangu-2.0-pro", "glm-5.2-sft-harmony", "qwen-vl-max", "qwen-vl-plus"]
+    "models": ["openpangu-2.0-flash", "openpangu-2.0-pro", "glm-5.2-sft-harmony"]
   }
 }
 ```
@@ -113,8 +124,6 @@ AK/SK 通过环境变量传入（`start.sh` 会自动从凭证文件注入）：
 | `openpangu-2.0-flash` | 盘古 flash 模型 (快速) |
 | `openpangu-2.0-pro` | 盘古 pro 模型 (高质量) |
 | `glm-5.2-sft-harmony` | GLM-5.2 SFT 调和版 |
-| `qwen-vl-max` | 通义千问 VL 多模态 (最强) |
-| `qwen-vl-plus` | 通义千问 VL 多模态 (标准) |
 
 ## API 端点
 

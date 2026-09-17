@@ -24,18 +24,29 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 BOLD='\033[1m'; DIM='\033[2m'
 
+# ── 环境适配（可选，全部可被环境变量覆盖）──
+#   VENV_PYTHON_DIR: venv 的 bin 目录，设置后 python3 优先用 venv（如 /root/runtime/aishell-glm52/venv/bin）
+#   API_PORT / CLOUDFLARED_BIN / CF_LOG / CF_URL_FILE 等均可通过环境变量覆盖，见上方配置区
+if [ -n "${VENV_PYTHON_DIR:-}" ]; then
+    export PATH="${VENV_PYTHON_DIR}:${PATH}"
+fi
+# 华为云平台以 JOB_ENV_HW_* 注入凭证 → 映射为 Snap Access 读取的 HW_*
+export HW_ACCESS_KEY="${HW_ACCESS_KEY:-${JOB_ENV_HW_ACCESS_KEY:-}}"
+export HW_SECRET_KEY="${HW_SECRET_KEY:-${JOB_ENV_HW_SECRET_KEY:-}}"
+export HW_SECURITY_TOKEN="${HW_SECURITY_TOKEN:-${JOB_ENV_HW_SECURITY_TOKEN:-}}"
+
 # ── 配置 ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 API_PORT="${API_PORT:-8080}"
-CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
-API_LOG="/tmp/api-server.log"
-CF_LOG="/tmp/cloudflared.log"
-REQ_LOG="/tmp/api-requests.log"
-API_PID_FILE="/tmp/api-server.pid"
-CF_PID_FILE="/tmp/cloudflared.pid"
-CF_URL_FILE="/tmp/cloudflared-url.txt"
-WATCHDOG_PID_FILE="/tmp/aishell-watchdog.pid"
-WATCHDOG_LOG="/tmp/aishell-watchdog.log"
+CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}"
+API_LOG="${API_LOG:-/tmp/api-server.log}"
+CF_LOG="${CF_LOG:-/tmp/cloudflared.log}"
+REQ_LOG="${REQ_LOG:-/tmp/api-requests.log}"
+API_PID_FILE="${API_PID_FILE:-/tmp/api-server.pid}"
+CF_PID_FILE="${CF_PID_FILE:-/tmp/cloudflared.pid}"
+CF_URL_FILE="${CF_URL_FILE:-/tmp/cloudflared-url.txt}"
+WATCHDOG_PID_FILE="${WATCHDOG_PID_FILE:-/tmp/aishell-watchdog.pid}"
+WATCHDOG_LOG="${WATCHDOG_LOG:-/tmp/aishell-watchdog.log}"
 WATCHDOG_INTERVAL=30  # 检查间隔（秒）
 
 # ── 输出函数 ──
