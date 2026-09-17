@@ -488,7 +488,28 @@ print_usage() {
     echo -e "${CYAN}${BOLD}🖥️  Cursor / VS Code 配置${NC}"
     echo -e "   ${GREEN}API Base URL:${NC}  ${PUBLIC_URL}/v1"
     echo -e "   ${GREEN}API Key:${NC}       any (不校验)"
-    echo -e "   ${GREEN}Model:${NC}          default / gpt-4 / glm-5.2 / deepseek-v4-flash-0731"
+    # 动态获取可用模型列表
+    local models_json
+    models_json=$(curl -s "${LOCAL_URL}/v1/models" 2>/dev/null || echo "")
+    if [ -n "$models_json" ]; then
+        local model_list
+        model_list=$(echo "$models_json" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin).get('data', [])
+    names = sorted(m['id'] for m in data if 'id' in m)
+    # 分行打印，每行最多 4 个
+    for i in range(0, len(names), 4):
+        print('   ' + '  '.join(n.ljust(25) for n in names[i:i+4]))
+except:
+    print('   (解析失败)')
+" 2>/dev/null || echo "   (解析失败)")
+        echo -e "${CYAN}${BOLD}🤖 可用模型${NC} (${YELLOW}共 $(echo "$models_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo '?') 个${NC})"
+        echo -e "$model_list"
+    else
+        echo -e "${CYAN}${BOLD}🤖 可用模型${NC}"
+        echo -e "   ${DIM}(API 未响应，稍后访问 ${LOCAL_URL}/v1/models 查看)${NC}"
+    fi
     echo ""
     echo -e "${CYAN}${BOLD}⚙️  服务管理${NC}"
     echo -e "   ${YELLOW}./start.sh status${NC}    查看运行状态"
