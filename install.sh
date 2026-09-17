@@ -16,6 +16,11 @@
 #   CF_LOG / CF_URL_FILE  隧道路由日志/URL 文件（默认本目录 cloudflared.log / cloudflared-url.txt）
 #
 # 启动完成后外网地址写入 $CF_URL_FILE，也可在启动输出中看到。
+#
+# 加速说明（2026-09 修订）：
+#   GitHub 直连在国内经常超时，原逻辑每个源最多死等 150s 才切换，最坏 450s。
+#   现改为：每个源先做 1MB Range 快速探测（10s 内判定），不通立即切下一个镜像；
+#   官方源下载 25s 快速失败，镜像源 120s；整体最坏等待从分钟级降到秒级。
 #===============================================================================
 set -euo pipefail
 
@@ -40,7 +45,9 @@ if [ ! -x "$RUNTIME/venv/bin/python" ]; then
 fi
 if ! "$RUNTIME/venv/bin/python" -c "import fastapi, uvicorn, httpx, huaweicloudsdkcore" 2>/dev/null; then
     echo "    安装依赖 (pip mirror: $PIP_MIRROR) ..."
-    "$RUNTIME/venv/bin/pip" install -q --index-url "$PIP_MIRROR" -r "$RUNTIME/requirements.txt"
+    # --timeout/--retries 防止网络抖动时 pip 长时间静默卡死
+    "$RUNTIME/venv/bin/pip" install -q --timeout 30 --retries 1 \
+        --index-url "$PIP_MIRROR" -r "$RUNTIME/requirements.txt"
 else
     echo "    依赖已就绪"
 fi
@@ -57,16 +64,40 @@ if [ ! -x "$RUNTIME/bin/cloudflared" ]; then
             aarch64) CFA="cloudflared-linux-arm64" ;;
             *) echo "不支持的架构: $ARCH"; exit 1 ;;
         esac
-        for base in \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download" \
-            "https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download" \
-            "https://gh-proxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download"; do
-            if curl -fSL --connect-timeout 8 --max-time 150 -o "$RUNTIME/bin/cloudflared" "$base/$CFA" 2>/dev/null \
+
+        # 源列表：GitHub 官方优先，加速镜像兜底。
+        # 每个源先 3s 快速探测，通了才下载；探测/下载失败立即切下一个，绝不死等。
+        BASES=(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download"
+            "https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download"
+            "https://gh-proxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download"
+            "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download"
+            "https://ghproxy.cc/https://github.com/cloudflare/cloudflared/releases/latest/download"
+            "https://gh.ddlc.top/https://github.com/cloudflare/cloudflared/releases/latest/download"
+            "https://github.moeyy.xyz/https://github.com/cloudflare/cloudflared/releases/latest/download"
+        )
+        for base in "${BASES[@]}"; do
+            url="$base/$CFA"
+            printf "    探测 %-20s " "${base#https://}"
+            # Range 请求探测（跟随重定向，只取前 1MB）：比 HEAD 更能反映真实下载通道
+            if ! curl -fsSL --connect-timeout 3 --max-time 10 -r 0-1048575 -o /dev/null "$url" 2>/dev/null; then
+                echo "不通，切换镜像"
+                continue
+            fi
+            echo "可用"
+            # 官方源给 25s 快速失败（不行立即换镜像），镜像源给 120s
+            TMO="120"
+            case "$base" in
+                https://github.com/*) TMO="25" ;;
+            esac
+            if curl -fSL --connect-timeout 5 --max-time "$TMO" -o "$RUNTIME/bin/cloudflared" "$url" 2>/dev/null \
                && [ "$(stat -c%s "$RUNTIME/bin/cloudflared" 2>/dev/null || echo 0)" -gt 10000000 ]; then
                 chmod +x "$RUNTIME/bin/cloudflared"
-                echo "    cloudflared 就绪 ($(stat -c%s "$RUNTIME/bin/cloudflared") bytes)"
+                echo "    cloudflared 就绪 ($(stat -c%s "$RUNTIME/bin/cloudflared") bytes, 来自 ${base#https://})"
                 exit 0
             fi
+            rm -f "$RUNTIME/bin/cloudflared" 2>/dev/null || true
+            echo "    下载失败/超时，切换镜像"
         done
         echo "    cloudflared 下载失败，请检查网络"; exit 1
     ) &

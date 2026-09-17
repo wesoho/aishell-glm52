@@ -331,10 +331,20 @@ start_tunnel() {
 
         GITHUB_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${CFA_FILE}"
         DOWNLOAD_OK=false
-        for mirror in "https://ghfast.top" "https://gh-proxy.com" "https://mirror.ghproxy.com" ""; do
+        # 优先直连 GitHub，失败立即切镜像；每个源先 3s 快速探测，绝不死等
+        for mirror in "" "https://ghfast.top" "https://gh-proxy.com" "https://ghproxy.net" "https://ghproxy.cc" "https://gh.ddlc.top" "https://github.moeyy.xyz" "https://mirror.ghproxy.com"; do
             url="${mirror:+${mirror}/}${GITHUB_URL}"
             print_info "尝试: ${url}"
-            if curl -fSL -o /tmp/cloudflared_dl --connect-timeout 10 --max-time 120 "$url" 2>/dev/null; then
+            case "${mirror}" in
+                "") TMO=25 ;;   # 官方源：25s 快速失败，不行立即换镜像
+                *)  TMO=120 ;;
+            esac
+            # Range 请求探测（跟随重定向，只取前 1MB），比 HEAD 更能反映真实下载通道
+            if ! curl -fsSL -o /dev/null --connect-timeout 3 --max-time 10 -r 0-1048575 "$url" 2>/dev/null; then
+                print_info "  不可用，立即切换下一个源"
+                continue
+            fi
+            if curl -fSL -o /tmp/cloudflared_dl --connect-timeout 5 --max-time "$TMO" "$url" 2>/dev/null; then
                 SIZE=$(stat -c%s /tmp/cloudflared_dl 2>/dev/null || echo 0)
                 if [ "$SIZE" -gt 10000000 ]; then
                     chmod +x /tmp/cloudflared_dl
@@ -345,6 +355,8 @@ start_tunnel() {
                     break
                 fi
             fi
+            rm -f /tmp/cloudflared_dl 2>/dev/null || true
+            print_info "  下载失败，立即切换下一个源"
         done
         [ "${DOWNLOAD_OK}" = false ] && { print_error "cloudflared 下载失败"; exit 1; }
     else
