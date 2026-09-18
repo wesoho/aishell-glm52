@@ -152,10 +152,11 @@ def _find_api_key() -> str:
     # 策略 1: 已知凭证文件路径（毫秒级，glob 匹配）
     _KEY_MARK = "JOB_ENV_MODEL_API_KEY"
     _credential_globs = [
+        # start.sh 校验通过后会写入该文件；放最前面，避免捡到其他环境凭证文件里的坏 key
+        "/tmp/model_api_key.txt",
         "/root/job-envs/sandboxes/*/.dsh/.credentials.yaml",
         "/root/job-envs/sandboxes/*/.jiuwenswarm/config/.env",
         "/root/.dsh/.credentials.yaml",
-        "/tmp/model_api_key.txt",
     ]
     for pattern in _credential_globs:
         for fpath in glob.glob(pattern):

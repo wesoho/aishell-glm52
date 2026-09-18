@@ -1,1 +1,9 @@
 __pycache__/
+*.pyc
+venv/
+bin/
+*.log
+cloudflared-url.txt
+cloudflared.log
+api-server.log
+model_api_key.txt

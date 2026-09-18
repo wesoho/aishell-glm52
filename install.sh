@@ -128,7 +128,7 @@ fi
 echo "==> [5/5] 启动服务"
 cd "$RUNTIME"
 export PATH="$RUNTIME/venv/bin:$PATH"
-export API_PORT="${API_PORT:-17180}"
+# API_PORT 由 start.sh 统一默认（8080），如需改端口用环境变量 API_PORT 传入
 export CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-$RUNTIME/bin/cloudflared}"
 export CF_LOG="${CF_LOG:-$RUNTIME/cloudflared.log}"
 export CF_URL_FILE="${CF_URL_FILE:-$RUNTIME/cloudflared-url.txt}"

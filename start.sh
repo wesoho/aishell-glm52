@@ -5,6 +5,8 @@
 # 用法:
 #   ./start.sh              启动服务 (API + Cloudflare 隧道) + 保活看门狗
 #   ./start.sh stop         停止所有服务 (API + 隧道 + 看门狗)
+#   ./start.sh stop-api     仅停止 API（保留隧道与看门狗）
+#   ./start.sh tunnel       仅启动/重启隧道（不影响 API）
 #   ./start.sh restart      仅重启 API 服务，保留隧道（域名不变）
 #   ./start.sh status       查看运行状态
 #   ./start.sh logs         查看日志 (请求日志 + API 日志 + 隧道日志)
@@ -49,6 +51,10 @@ WATCHDOG_PID_FILE="${WATCHDOG_PID_FILE:-/tmp/aishell-watchdog.pid}"
 WATCHDOG_LOG="${WATCHDOG_LOG:-/tmp/aishell-watchdog.log}"
 WATCHDOG_INTERVAL=30  # 检查间隔（秒）
 
+# 上游验证参数（从 config.json 读取，用于启动时校验 API Key 有效性）
+_UPSTREAM_BASE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("upstream_base_url","https://tokenhub.developer.huaweicloud.com/v2"))' "${SCRIPT_DIR}/config.json" 2>/dev/null || echo 'https://tokenhub.developer.huaweicloud.com/v2')"
+_UPSTREAM_MODEL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("upstream_default_model","deepseek-v4-flash-0731"))' "${SCRIPT_DIR}/config.json" 2>/dev/null || echo 'deepseek-v4-flash-0731')"
+
 # ── 输出函数 ──
 print_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
@@ -64,6 +70,8 @@ OpenAI 兼容 API 服务启动脚本
 用法:
   ./start.sh              启动服务 (API + Cloudflare 隧道 + 保活看门狗)
   ./start.sh stop         停止所有服务 (API + 隧道 + 看门狗)
+  ./start.sh stop-api     仅停止 API（保留隧道与看门狗）
+  ./start.sh tunnel       仅启动/重启隧道（不影响 API）
   ./start.sh restart      仅重启 API 服务，保留隧道（域名不变）
   ./start.sh status       查看运行状态
   ./start.sh logs         查看最近日志 (请求 + API + 隧道)
@@ -95,6 +103,14 @@ tunnel_alive() {
 # ── 检查 API 是否存活 ──
 api_alive() {
     curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1
+}
+
+# ── 检查隧道是否真正可用（URL 能返回业务页面，而非只进程活着）──
+tunnel_serves() {
+    local url
+    url=$(get_tunnel_url)
+    [ -n "$url" ] || return 1
+    curl -sf --connect-timeout 5 --max-time 10 "${url}/health" >/dev/null 2>&1
 }
 
 # ── 停止 API 服务 ──
@@ -205,37 +221,70 @@ show_logs() {
     exit 0
 }
 
-# ── 注入 API Key ──
+# ── 校验 API Key 是否被上游接受（200/429=有效, 401=失效）──
+key_valid() {
+    [ -n "$1" ] || return 1
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 \
+        -X POST "${_UPSTREAM_BASE}/chat/completions" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $1" \
+        -d "{\"model\":\"${_UPSTREAM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" 2>/dev/null || echo 000)
+    case "${code}" in
+        200|429) return 0 ;;
+        *)       return 1 ;;
+    esac
+}
+
+# ── 注入 API Key（逐个候选校验，跳过无效 key，避免上游 401 apiKey解密失败）──
 inject_api_key() {
-    if [ -z "${JOB_ENV_MODEL_API_KEY:-}" ]; then
-        for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml /tmp/model_api_key.txt; do
-            if [ -f "$credfile" ] && grep -q "JOB_ENV_MODEL_API_KEY" "$credfile" 2>/dev/null; then
-                _key=$(grep 'JOB_ENV_MODEL_API_KEY' "$credfile" | head -1 | sed 's/.*: *"//' | sed 's/"$//')
-                if [ -n "$_key" ]; then
-                    export JOB_ENV_MODEL_API_KEY="$_key"
-                    print_success "从凭证文件注入 API Key"
-                    return
-                fi
-            fi
-        done
-        if [ -f /tmp/model_api_key.txt ]; then
-            _key=$(cat /tmp/model_api_key.txt | tr -d '[:space:]')
-            if [ -n "$_key" ] && [ ${#_key} -gt 20 ]; then
-                export JOB_ENV_MODEL_API_KEY="$_key"
-                print_success "从 /tmp/model_api_key.txt 注入 API Key"
-                return
-            fi
+    local seen="" cand=""
+    # _try_key <key> <来源>：校验通过则注入，并写缓存文件供看门狗/裸启动兜底
+    _try_key() {
+        local k="$1" src="$2"
+        [ -n "$k" ] || return 1
+        if key_valid "$k"; then
+            export JOB_ENV_MODEL_API_KEY="$k"
+            printf '%s' "$k" > /tmp/model_api_key.txt 2>/dev/null || true
+            chmod 600 /tmp/model_api_key.txt 2>/dev/null || true
+            print_success "API Key 有效 (来自 ${src})"
+            return 0
         fi
-        for pid in $(ls /proc 2>/dev/null | grep '^[0-9]*$' | head -50); do
-            _key=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep '^JOB_ENV_MODEL_API_KEY=' | head -1 | cut -d= -f2-)
-            if [ -n "$_key" ]; then
-                export JOB_ENV_MODEL_API_KEY="$_key"
-                print_success "从 /proc/$pid 注入 API Key"
-                return
-            fi
-        done
-        print_warn "未找到 API Key，上游请求将无认证"
+        print_warn "API Key 无效，跳过 (来自 ${src})"
+        return 1
+    }
+
+    # 1) 环境变量（也校验，无效继续往下找）
+    if _try_key "${JOB_ENV_MODEL_API_KEY:-}" "环境变量"; then return; fi
+
+    # 2) /tmp/model_api_key.txt（上次校验通过的缓存）
+    if [ -f /tmp/model_api_key.txt ]; then
+        cand=$(tr -d '[:space:]' < /tmp/model_api_key.txt)
+        if _try_key "$cand" "/tmp/model_api_key.txt"; then return; fi
     fi
+
+    # 3) 凭证文件（跳过已试过的重复 key，避免重复打上游）
+    for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml; do
+        [ -f "$credfile" ] || continue
+        grep -q "JOB_ENV_MODEL_API_KEY" "$credfile" 2>/dev/null || continue
+        cand=$(grep 'JOB_ENV_MODEL_API_KEY' "$credfile" | head -1 | sed 's/.*: *"//' | sed 's/"$//')
+        [ -n "$cand" ] || continue
+        printf '%s\n' "$seen" | grep -qF -- "$cand" && continue
+        seen="${seen}${cand}\n"
+        if _try_key "$cand" "$(basename "$credfile")"; then return; fi
+    done
+
+    # 4) /proc 进程环境扫描（跳过已试过的重复 key）
+    for pid in $(ls /proc 2>/dev/null | grep '^[0-9]*$' | head -50); do
+        cand=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^JOB_ENV_MODEL_API_KEY=' | head -1 | cut -d= -f2-)
+        [ -n "$cand" ] || continue
+        printf '%s\n' "$seen" | grep -qF -- "$cand" && continue
+        seen="${seen}${cand}\n"
+        if _try_key "$cand" "/proc/$pid"; then return; fi
+    done
+
+    print_warn "未找到有效 API Key，上游请求将无认证"
+    unset JOB_ENV_MODEL_API_KEY
 }
 
 # ── 注入 Snap Access AK/SK ──
@@ -307,14 +356,18 @@ start_tunnel() {
         return
     fi
 
-    # 隧道已存活 — 复用，不重启
-    if tunnel_alive; then
+    # 隧道已存活且可用 — 复用，不重启（保证 restart 后外网地址不变）
+    if tunnel_alive && tunnel_serves; then
         TUNNEL_URL=$(get_tunnel_url)
-        if [ -n "$TUNNEL_URL" ]; then
-            print_success "隧道已在运行，复用现有隧道 — ${TUNNEL_URL}"
-            HAS_TUNNEL=true
-            return
-        fi
+        print_success "隧道已在运行且可用，复用现有隧道 — ${TUNNEL_URL}"
+        HAS_TUNNEL=true
+        return
+    fi
+    # 隧道进程在但已不可用 → 重建（将获得新地址，并写回 URL 文件）
+    if tunnel_alive; then
+        print_warn "隧道进程在但已不可用，重建隧道..."
+        stop_tunnel
+        sleep 1
     fi
 
     print_step "启动 Cloudflare 隧道"
@@ -418,6 +471,19 @@ CF_PID_FILE="${CF_PID_FILE}"
 CF_URL_FILE="${CF_URL_FILE}"
 WATCHDOG_LOG="${WATCHDOG_LOG}"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN}"
+UPSTREAM_BASE="${_UPSTREAM_BASE}"
+UPSTREAM_MODEL="${_UPSTREAM_MODEL}"
+
+_wd_key_valid() {
+    [ -n "\$1" ] || return 1
+    local code
+    code=\$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 12 \
+        -X POST "\${UPSTREAM_BASE}/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer \$1" \
+        -d "{\"model\":\"\${UPSTREAM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" 2>/dev/null || echo 000)
+    case "\$code" in 200|429) return 0 ;; *) return 1 ;; esac
+}
 
 while true; do
     sleep "\$interval" 2>/dev/null || exit 0
@@ -428,15 +494,27 @@ while true; do
         echo "[\$ts] API down, restarting..." >> "\$WATCHDOG_LOG"
         pkill -f "python3.*main.py" 2>/dev/null
         sleep 1
-        for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml /tmp/model_api_key.txt; do
-            if [ -f "\$credfile" ] && grep -q "JOB_ENV_MODEL_API_KEY" "\$credfile" 2>/dev/null; then
-                _key=\$(grep "JOB_ENV_MODEL_API_KEY" "\$credfile" 2>/dev/null | head -1 | sed 's/.*: *"//' | sed 's/"$//' 2>/dev/null)
-                if [ -n "\$_key" ]; then
-                    export JOB_ENV_MODEL_API_KEY="\$_key"
+        KEY_SET=""
+        if [ -f /tmp/model_api_key.txt ]; then
+            _cand=\$(tr -d '[:space:]' < /tmp/model_api_key.txt)
+            if _wd_key_valid "\$_cand"; then
+                export JOB_ENV_MODEL_API_KEY="\$_cand"; KEY_SET=1
+            else
+                echo "[\$ts] /tmp/model_api_key.txt key invalid, trying others" >> "\$WATCHDOG_LOG"
+            fi
+        fi
+        if [ -z "\$KEY_SET" ]; then
+            for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml; do
+                [ -f "\$credfile" ] && grep -q "JOB_ENV_MODEL_API_KEY" "\$credfile" 2>/dev/null || continue
+                _cand=\$(grep "JOB_ENV_MODEL_API_KEY" "\$credfile" 2>/dev/null | head -1 | sed 's/.*: *"//' | sed 's/"$//' 2>/dev/null)
+                if _wd_key_valid "\$_cand"; then
+                    export JOB_ENV_MODEL_API_KEY="\$_cand"; KEY_SET=1
+                    printf '%s' "\$_cand" > /tmp/model_api_key.txt 2>/dev/null || true
                     break
                 fi
-            fi
-        done
+            done
+        fi
+        [ -z "\$KEY_SET" ] && echo "[\$ts] 未找到有效 API Key" >> "\$WATCHDOG_LOG"
         cd "\$SCRIPT_DIR" 2>/dev/null
         API_PORT="\$API_PORT" setsid python3 main.py >> "\$API_LOG" 2>&1 &
         echo \$! > "\$API_PID_FILE" 2>/dev/null
@@ -537,7 +615,8 @@ except:
     echo -e "${CYAN}${BOLD}⚙️  服务管理${NC}"
     echo -e "   ${YELLOW}./start.sh status${NC}    查看运行状态"
     echo -e "   ${YELLOW}./start.sh stop${NC}      停止所有服务 (API + 隧道 + 看门狗)"
-    echo -e "   ${YELLOW}./start.sh restart${NC}   仅重启 API，保留隧道域名"
+    echo -e "   ${YELLOW}./start.sh restart${NC}   仅重启 API，保留隧道域名（客户端地址不变）"
+    echo -e "   ${YELLOW}./start.sh tunnel${NC}    仅启动/重启隧道（不影响 API）"
     echo -e "   ${YELLOW}./start.sh logs${NC}       查看日志"
     echo ""
 }
@@ -549,6 +628,8 @@ except:
 case "${1:-}" in
     --help|-h) show_help ;;
     stop)      stop_services; exit 0 ;;
+    stop-api)  print_step "仅停止 API（保留隧道与看门狗）"; stop_api; exit 0 ;;
+    tunnel)    print_step "仅启动/重启隧道（不影响 API）"; start_tunnel; print_usage; exit 0 ;;
     status)    show_status; exit $? ;;
     logs)      show_logs "${2:-}"; exit 0 ;;
 esac
@@ -559,13 +640,14 @@ if [ "${1:-}" = "restart" ]; then
     stop_api
     sleep 1
     start_api || exit 1
-    # 复用已有隧道
-    if tunnel_alive; then
+    # 复用已有隧道；仅当隧道不可用时才重建（会换新地址）
+    if tunnel_alive && tunnel_serves; then
         TUNNEL_URL=$(get_tunnel_url)
         HAS_TUNNEL=true
+        print_success "隧道已保留 — ${TUNNEL_URL}"
     else
-        HAS_TUNNEL=false
-        TUNNEL_URL=""
+        [ "$HAS_TUNNEL" = true ] && print_warn "隧道不可用，重建隧道..."
+        start_tunnel
     fi
     print_usage
     exit 0

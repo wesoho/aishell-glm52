@@ -50,17 +50,22 @@ bash install.sh          # 自动装依赖 + cloudflared + 注入 AK/SK + 启动
 
 > 安装脚本会自动跳过已装部分（幂等），依赖安装与 cloudflared 下载并行执行。
 > 华为云平台沙箱内运行时，AK/SK 由平台注入（`JOB_ENV_HW_*`），脚本自动映射。
+> 默认端口 8080（可用环境变量 `API_PORT` 修改）。**重复运行 install.sh / start.sh 不会重启已在运行的隧道，外网地址保持不变。**
 
 ## 快速开始
 
 ```bash
-./start.sh              # 启动服务 + Cloudflare 隧道 + 保活看门狗
+./start.sh              # 启动全部 (API + Cloudflare 隧道 + 保活看门狗；隧道已运行则复用，地址不变)
+./start.sh restart      # 仅重启 API —— 隧道不重启，外网地址不变，客户端无需改配置
+./start.sh tunnel       # 仅启动/重启隧道（不影响 API；仅在隧道挂掉时才会换新地址）
+./start.sh stop-api     # 仅停止 API（保留隧道与看门狗）
+./start.sh stop         # 停止所有服务 (API + 隧道 + 看门狗)
 ./start.sh status       # 查看状态 (API + 隧道 + 看门狗)
-./start.sh restart      # 仅重启 API，保留隧道域名不变
-./start.sh stop         # 停止所有服务
 ./start.sh logs         # 查看日志
 ./start.sh logs -f      # 实时跟踪日志
 ```
+
+> **隧道与服务分离**：`restart` / `stop-api` / 看门狗拉起 API 都不会重启 Cloudflare 隧道，免费隧道域名保持不变；只有隧道进程本身挂掉（或 `./start.sh stop` / 环境重建）才会重建并拿到新域名。
 
 ## 配置
 
@@ -80,6 +85,21 @@ bash install.sh          # 自动装依赖 + cloudflared + 注入 AK/SK + 启动
 | `NO_TUNNEL` | `NO_TUNNEL` | 0 | 设为 1 不启动隧道 |
 | `NO_WATCHDOG` | `NO_WATCHDOG` | 0 | 设为 1 不启动看门狗 |
 | `max_input_chars` | — | 300000 | prompt 最大输入字符数 (上游限制 307200) |
+
+### API Key 自动校验（防止 401 apiKey解密失败）
+
+启动 / 看门狗拉起 API 时，脚本会按优先级寻找 API Key 并**逐个向上游发最小请求校验**，无效的自动跳过（日志打印 `API Key 无效，跳过`），避免捡到其他环境凭证文件里的坏 Key 导致上游报 `401 apiKey解密失败`：
+
+| 优先级 | 来源 |
+|--------|------|
+| 1 | 环境变量 `JOB_ENV_MODEL_API_KEY` |
+| 2 | `/tmp/model_api_key.txt`（校验通过的缓存 / 手动覆盖文件） |
+| 3 | `/root/job-envs/sandboxes/*/.dsh/.credentials.yaml` 等凭证文件 |
+| 4 | `/proc/*/environ` 中其他进程携带的 key |
+
+- 校验通过的 key 会写入 `/tmp/model_api_key.txt` 供看门狗与裸启动兜底。
+- 手动指定 key：把有效 key 写入 `/tmp/model_api_key.txt`（单行无引号），然后 `./start.sh restart`。
+- Key 是临时会话凭证（约 24h 过期），过期后出现 401 时更新 `/tmp/model_api_key.txt` 并 restart 即可。
 
 ### Snap Access 配置
 
@@ -209,6 +229,11 @@ TokenHub 和 Snap Access 的 SSE 格式有细微差异：
 ### 7. 上游 prompt 字符数硬限制 307200
 
 TokenHub 上游 API 限制 prompt 最大 **307200 字符**（注意是字符数不是 token 数），超出返回错误。解决方案：在发送上游前自动检测并截断，安全阈值 300000（可配置 `max_input_chars`）。
+
+## 经验教训（续）
+
+> ### 8. 沙箱内多个环境的凭证文件可能混入无效 Key（上游 401 apiKey解密失败）
+> 华为云沙箱里每个环境（deepseek-harness / jiuwenswarm 等）都有自己的凭证文件；其中可能存着**加密信封格式**的 Key，直接发给 TokenHub 上游会被拒（`401 apiKey解密失败`）。v3.3 起 `start.sh` 与看门狗都会对候选 Key 逐个校验（发一个最小 chat 请求，200/429 视为有效），无效自动跳过再试下一个，并把有效的 Key 缓存到 `/tmp/model_api_key.txt`。不要再依赖“第一个捡到的 Key”。
 
 ## 参考
 
