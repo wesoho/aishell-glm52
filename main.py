@@ -119,12 +119,18 @@ RETRY_BACKOFF = _cfg("retry_backoff", 0.5, float)
 
 MAX_CONCURRENT = _cfg("max_concurrent", 20, int)
 
+# Snap Access 上游并发会话上限（盘古硬限制 3 个并发会话，留 1 余量防残留顶满；超出的请求排队等待）
+SNAP_MAX_CONCURRENT = _cfg("snap_max_concurrent", 2, int)
+
 # 上游速率限制 (令牌桶)
 UPSTREAM_RATE_LIMIT = _cfg("upstream_rate_limit", 4, float)   # 每秒允许请求数
 UPSTREAM_RATE_BURST = _cfg("upstream_rate_burst", 4, int)     # 突发桶大小
 # 429 专用重试 (比通用重试更激进)
 RETRY_429_MAX = _cfg("retry_429_max", 5, int)
 RETRY_429_BASE = _cfg("retry_429_base", 0.3, float)           # 基础等待
+# 并发会话占满(400) 专用重试：次数更多、等待更长，覆盖上游会话释放窗口（upstream ~30-60s）
+RETRY_CONC_MAX = _cfg("retry_conc_max", 8, int)
+RETRY_CONC_BASE = _cfg("retry_conc_base", 6.0, float)
 
 MAX_BODY_SIZE = _cfg("max_body_size_mb", 10, int) * 1024 * 1024
 
@@ -254,6 +260,7 @@ logger.info(f"Max body size: {MAX_BODY_SIZE // 1024 // 1024}MB, Log rotation: {L
 UPSTREAM_TIMEOUT = httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT, write=WRITE_TIMEOUT)
 _http_client: Optional[httpx.AsyncClient] = None
 _semaphore: Optional[asyncio.Semaphore] = None
+_snap_semaphore: Optional[asyncio.Semaphore] = None
 _inflight_requests = 0
 
 _upstream_healthy = True
@@ -282,6 +289,14 @@ def get_semaphore() -> asyncio.Semaphore:
     if _semaphore is None:
         _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     return _semaphore
+
+
+def get_snap_semaphore() -> asyncio.Semaphore:
+    """Snap Access 专用并发信号量：限制同时发往盘古上游的活跃流式会话数，超出的排队"""
+    global _snap_semaphore
+    if _snap_semaphore is None:
+        _snap_semaphore = asyncio.Semaphore(SNAP_MAX_CONCURRENT)
+    return _snap_semaphore
 
 
 # ── 令牌桶限速器 ──
@@ -736,6 +751,11 @@ def _openai_error(message: str, status: int, etype: str = "invalid_request_error
 def _should_retry(status_code: int) -> bool:
     return status_code >= 500 or status_code == 429
 
+
+def _is_concurrency_limit(err_text: str) -> bool:
+    """判断上游错误是否是"并发会话数已达上限"（盘古硬限制）——这类 400 应等待后重试"""
+    return "并发会话" in err_text or "concurrent" in err_text.lower()
+
 # ──────────────────────────────────────────────
 # 流式 chunk 转换
 # ──────────────────────────────────────────────
@@ -856,6 +876,34 @@ def _upstream_headers():
 
 
 async def call_upstream_chat(payload: dict, stream: bool = False, request_id: str = ""):
+    """对外入口：Snap Access 请求加并发队列（超过 SNAP_MAX_CONCURRENT 的排队等待），TokenHub 原样直发。
+
+    注意：stream=True 时 _call_upstream_chat_impl 返回 async generator，信号量必须包住生成器
+    的整个迭代生命周期（第一个字节到 [DONE]），否则返回生成器瞬间信号量就被释放、队列形同虚设。
+    """
+    use_snap = _is_snap_access_model(payload.get("model", ""))
+    if not use_snap:
+        return await _call_upstream_chat_impl(payload, stream=stream, request_id=request_id)
+
+    snap = get_snap_semaphore()
+    if snap.locked():
+        logger.warning(f"[{request_id}] Snap Access 并发已达上限({SNAP_MAX_CONCURRENT})，请求排队等待空闲会话...")
+
+    if not stream:
+        async with snap:
+            return await _call_upstream_chat_impl(payload, stream=False, request_id=request_id)
+
+    async def _snap_queued_stream():
+        if snap.locked():
+            logger.warning(f"[{request_id}] Snap Access 并发会话已满({SNAP_MAX_CONCURRENT})，请求排队等待空闲会话...")
+        async with snap:
+            gen = await _call_upstream_chat_impl(payload, stream=True, request_id=request_id)
+            async for chunk in gen:
+                yield chunk
+    return _snap_queued_stream()
+
+
+async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_id: str = ""):
     model = payload.get("model", "")
     use_snap = _is_snap_access_model(model)
     if use_snap:
@@ -875,7 +923,8 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
             state = {"first": True, "done_sent": False, "finish_sent": False,
                      "usage": None, "chunk_id": "", "model": "", "created": 0}
             retry_count = 0
-            while retry_count <= MAX_RETRIES:
+            _MAX_RETRY_BOUND = max(MAX_RETRIES, RETRY_CONC_MAX, RETRY_429_MAX)
+            while retry_count <= _MAX_RETRY_BOUND:
                 try:
                     await _wait_cooldown()
                     await get_rate_limiter().acquire()
@@ -885,10 +934,15 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
                                 body = await resp.aread()
                                 err_text = body.decode("utf-8", errors="replace")[:500]
                                 err_msg, err_code = _parse_upstream_error(err_text)
-                                retry_max = RETRY_429_MAX if resp.status_code == 429 else MAX_RETRIES
-                                if _should_retry(resp.status_code) and retry_count < retry_max:
+                                concurrency_wait = _is_concurrency_limit(err_msg)
+                                retry_max = RETRY_CONC_MAX if concurrency_wait else (RETRY_429_MAX if resp.status_code == 429 else MAX_RETRIES)
+                                if (concurrency_wait or _should_retry(resp.status_code)) and retry_count < retry_max:
                                     retry_count += 1
-                                    if resp.status_code == 429:
+                                    if concurrency_wait:
+                                        wait = RETRY_CONC_BASE * (2 ** (retry_count - 1)) + random.uniform(0, 2.0)
+                                        wait = min(wait, 45.0)
+                                        logger.warning(f"[{request_id}] 上游并发会话占满，等待 {wait:.1f}s 后重试 {retry_count}/{retry_max}")
+                                    elif resp.status_code == 429:
                                         wait = RETRY_429_BASE * (2 ** (retry_count - 1)) + random.uniform(0, 0.1)
                                     else:
                                         wait = RETRY_BACKOFF * (2 ** (retry_count - 1))
@@ -935,7 +989,7 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
                     return
         return stream_generator()
     else:
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(max(MAX_RETRIES, RETRY_CONC_MAX, RETRY_429_MAX) + 1):
             try:
                 await _wait_cooldown()
                 await get_rate_limiter().acquire()
@@ -945,9 +999,15 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
                     data = resp.json()
                     _record_usage(data.get("usage", {}))
                     return data
-                retry_max = RETRY_429_MAX if resp.status_code == 429 else MAX_RETRIES
-                if _should_retry(resp.status_code) and attempt < retry_max:
-                    if resp.status_code == 429:
+                err_msg, err_code = _parse_upstream_error(resp.text[:1000])
+                concurrency_wait = _is_concurrency_limit(err_msg)
+                retry_max = RETRY_CONC_MAX if concurrency_wait else (RETRY_429_MAX if resp.status_code == 429 else MAX_RETRIES)
+                if (concurrency_wait or _should_retry(resp.status_code)) and attempt < retry_max:
+                    if concurrency_wait:
+                        wait = RETRY_CONC_BASE * (2 ** attempt) + random.uniform(0, 2.0)
+                        wait = min(wait, 45.0)
+                        logger.warning(f"[{request_id}] 上游并发会话占满，等待 {wait:.1f}s 后重试 {attempt+1}/{retry_max}")
+                    elif resp.status_code == 429:
                         await _trigger_cooldown(1.0)
                         wait = RETRY_429_BASE * (2 ** attempt) + random.uniform(0, 0.1)
                     else:
@@ -955,7 +1015,6 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
                     logger.warning(f"[{request_id}] 上游 {resp.status_code}, 重试 {attempt+1}/{retry_max} ({wait:.2f}s)")
                     await asyncio.sleep(wait)
                     continue
-                err_msg, err_code = _parse_upstream_error(resp.text[:1000])
                 logger.error(f"[{request_id}] 上游错误 {resp.status_code}: {err_msg}")
                 return {"error": True, "status": resp.status_code, "message": err_msg, "code": err_code}
             except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:

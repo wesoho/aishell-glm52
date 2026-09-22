@@ -461,6 +461,13 @@ start_watchdog() {
 # aishell-glm52 保活看门狗 (自动生成)
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"
 
+# 优先使用 venv 内的 Python（依赖装在 venv 里，系统 python 缺 httpx 等模块）
+if [ -x "\${SCRIPT_DIR:-}/venv/bin/python3" ]; then
+    PYTHON_BIN="\${SCRIPT_DIR}/venv/bin/python3"
+else
+    PYTHON_BIN="python3"
+fi
+
 API_PORT="${API_PORT}"
 SCRIPT_DIR="${SCRIPT_DIR}"
 interval=${WATCHDOG_INTERVAL}
@@ -516,7 +523,7 @@ while true; do
         fi
         [ -z "\$KEY_SET" ] && echo "[\$ts] 未找到有效 API Key" >> "\$WATCHDOG_LOG"
         cd "\$SCRIPT_DIR" 2>/dev/null
-        API_PORT="\$API_PORT" setsid python3 main.py >> "\$API_LOG" 2>&1 &
+        API_PORT="\$API_PORT" setsid "\$PYTHON_BIN" main.py >> "\$API_LOG" 2>&1 &
         echo \$! > "\$API_PID_FILE" 2>/dev/null
         sleep 3
         if curl -sf "http://localhost:\${API_PORT}/health" >/dev/null 2>&1; then
