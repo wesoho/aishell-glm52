@@ -806,8 +806,10 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
         delta.pop("reasoning_content", None)
         if delta.get("content"):
             has_content = True
+            state["content_seen"] = True
         if delta.get("tool_calls"):
             has_tool_calls = True
+            state["content_seen"] = True
         if delta.get("finish_reason"):
             has_finish = True
             state["finish_sent"] = True
@@ -929,7 +931,7 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
         async def stream_generator():
             state = {"first": True, "done_sent": False, "finish_sent": False,
                      "usage": None, "chunk_id": "", "model": model or "", "created": int(time.time()),
-                     "requested_model": model or ""}
+                     "requested_model": model or "", "content_seen": False}
             # 立即发出首个 role chunk：上游首字之前客户端先收到数据，避免客户端首字超时判定失败
             _preamble = {"id": _make_chunk_id(state), "object": "chat.completion.chunk",
                          "created": state["created"], "model": state["requested_model"] or state["model"],
@@ -1011,6 +1013,11 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
                                     await reader_task
                                 except BaseException:
                                     pass
+                            if not state.get("done_sent") and not state.get("content_seen") and retry_count < _MAX_RETRY_BOUND:
+                                retry_count += 1
+                                logger.warning(f"[{request_id}] 上游返回空响应(无内容 chunk)，重试 {retry_count}/{_MAX_RETRY_BOUND}")
+                                await asyncio.sleep(RETRY_BACKOFF)
+                                continue
                             if not state.get("done_sent"):
                                 if not state.get("finish_sent"):
                                     fin = {"id": _make_chunk_id(state), "object": "chat.completion.chunk",
