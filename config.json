@@ -25,6 +25,9 @@
       "openpangu-2.0-pro",
       "glm-5.2-sft-harmony"
     ],
-    "max_concurrent": 2
+    "max_concurrent": 2,
+    "disable_thinking_models": [
+      "glm-5.2-sft-harmony"
+    ]
   }
 }

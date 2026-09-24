@@ -104,6 +104,7 @@ SNAP_ACCESS_MODELS: list = _snap_cfg.get("models", [
     "qwen-vl-max",
     "qwen-vl-plus",
 ])
+SNAP_DISABLE_THINKING_MODELS: list = _snap_cfg.get("disable_thinking_models", [])
 SNAP_ACCESS_AK = os.environ.get("HW_ACCESS_KEY", "")
 SNAP_ACCESS_SK = os.environ.get("HW_SECRET_KEY", "")
 SNAP_ACCESS_SECURITY_TOKEN = os.environ.get("HW_SECURITY_TOKEN", "")
@@ -770,7 +771,7 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
         if not state.get("finish_sent"):
             cid = _make_chunk_id(state)
             fin = {"id": cid, "object": "chat.completion.chunk", "created": state.get("created", int(time.time())),
-                   "model": state.get("model", ""), "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                   "model": state.get("requested_model") or state.get("model", ""), "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             if state.get("usage"):
                 fin["usage"] = state["usage"]
                 _record_usage(state["usage"])
@@ -793,6 +794,8 @@ def _transform_stream_chunk(line: str, state: dict) -> Optional[str]:
         state["chunk_id"] = chunk["id"]
     if "model" in chunk:
         state["model"] = chunk["model"]
+        # Snap Access 上游会返回不同模型名(如 glm-5.2-harmony)，统一改回请求名，避免严格客户端报错
+        chunk["model"] = state.get("requested_model") or state["model"]
     if "created" in chunk:
         state["created"] = chunk["created"]
     chunk["id"] = _make_chunk_id(state)
@@ -907,6 +910,10 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
     model = payload.get("model", "")
     use_snap = _is_snap_access_model(model)
     if use_snap:
+        # 对配置的模型默认关闭深度思考（Snap Access 上游思考期可长达 10s+，客户端易误判超时）
+        if model in SNAP_DISABLE_THINKING_MODELS and "thinking" not in payload:
+            payload = dict(payload)
+            payload["thinking"] = {"type": "disabled"}
         url = f"{SNAP_ACCESS_BASE_URL}/chat/completions"
         body_str = json.dumps(payload, ensure_ascii=False)
         headers = _build_snap_headers("POST", url, body_str)
@@ -921,7 +928,8 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
     if stream:
         async def stream_generator():
             state = {"first": True, "done_sent": False, "finish_sent": False,
-                     "usage": None, "chunk_id": "", "model": "", "created": 0}
+                     "usage": None, "chunk_id": "", "model": model or "", "created": 0,
+                     "requested_model": model or ""}
             retry_count = 0
             _MAX_RETRY_BOUND = max(MAX_RETRIES, RETRY_CONC_MAX, RETRY_429_MAX)
             while retry_count <= _MAX_RETRY_BOUND:
@@ -953,16 +961,47 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
                                 yield f"data: {json.dumps({'error': {'message': err_msg, 'code': resp.status_code, 'type': 'upstream_error'}})}\n\n"
                                 yield "data: [DONE]\n\n"
                                 return
-                            async for line in resp.aiter_lines():
-                                if not line.strip():
-                                    continue
-                                transformed = _transform_stream_chunk(line, state)
-                                if transformed:
-                                    yield transformed
+                            # ── 静默期保活：上游思考时可能长时间无数据，发 SSE 注释行防止客户端超时 ──
+                            stream_q = asyncio.Queue(maxsize=64)
+                            async def _upstream_line_reader():
+                                try:
+                                    async for line in resp.aiter_lines():
+                                        await stream_q.put(line)
+                                except Exception as _e:
+                                    await stream_q.put(("__ERR__", _e))
+                                finally:
+                                    await stream_q.put(None)
+                            reader_task = asyncio.ensure_future(_upstream_line_reader())
+                            try:
+                                while True:
+                                    try:
+                                        got = await asyncio.wait_for(stream_q.get(), timeout=2.5)
+                                    except asyncio.TimeoutError:
+                                        # 上游思考期可能长时间静默，发 SSE 注释行保活（客户端忽略注释，仅重置读超时）
+                                        logger.info(f"[{request_id}] keepalive -> client")
+                                        yield ": keepalive\n\n"
+                                        continue
+                                    if got is None:
+                                        break
+                                    if isinstance(got, tuple) and got and got[0] == "__ERR__":
+                                        raise RuntimeError(f"upstream stream read failed: {got[1]}")
+                                    line = got
+                                    if not line.strip():
+                                        continue
+                                    transformed = _transform_stream_chunk(line, state)
+                                    if transformed:
+                                        yield transformed
+                            finally:
+                                if not reader_task.done():
+                                    reader_task.cancel()
+                                try:
+                                    await reader_task
+                                except BaseException:
+                                    pass
                             if not state.get("done_sent"):
                                 if not state.get("finish_sent"):
                                     fin = {"id": _make_chunk_id(state), "object": "chat.completion.chunk",
-                                           "created": state.get("created", int(time.time())), "model": state.get("model", ""),
+                                           "created": state.get("created", int(time.time())), "model": state.get("requested_model") or state.get("model", ""),
                                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                                     if state.get("usage"):
                                         fin["usage"] = state["usage"]
@@ -1085,6 +1124,8 @@ async def chat_completions(raw_request: Request):
         if isinstance(result, dict) and result.get("error"):
             return _openai_error(result["message"], result.get("status", 502), "upstream_error", result.get("code"))
         result = _strip_reasoning(result)
+        if isinstance(result, dict) and model_name:
+            result["model"] = model_name
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         logger.info(f"[{request_id}] chat done | model={model_name} | content_len={len(content)} | content={content[:200]}")
         resp_headers = {"x-request-id": request_id}

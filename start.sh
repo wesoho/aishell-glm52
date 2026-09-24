@@ -39,6 +39,10 @@ export HW_SECURITY_TOKEN="${HW_SECURITY_TOKEN:-${JOB_ENV_HW_SECURITY_TOKEN:-}}"
 
 # ── 配置 ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 自动优先使用 venv 内的 Python（install.sh 靠 PATH 注入 venv；直接运行 start.sh 时也保障依赖可用）
+if [ -z "${VENV_PYTHON_DIR:-}" ] && [ -x "$SCRIPT_DIR/venv/bin/python3" ]; then
+    export PATH="$SCRIPT_DIR/venv/bin:$PATH"
+fi
 API_PORT="${API_PORT:-8080}"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}"
 API_LOG="${API_LOG:-/tmp/api-server.log}"
@@ -461,13 +465,6 @@ start_watchdog() {
 # aishell-glm52 保活看门狗 (自动生成)
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"
 
-# 优先使用 venv 内的 Python（依赖装在 venv 里，系统 python 缺 httpx 等模块）
-if [ -x "\${SCRIPT_DIR:-}/venv/bin/python3" ]; then
-    PYTHON_BIN="\${SCRIPT_DIR}/venv/bin/python3"
-else
-    PYTHON_BIN="python3"
-fi
-
 API_PORT="${API_PORT}"
 SCRIPT_DIR="${SCRIPT_DIR}"
 interval=${WATCHDOG_INTERVAL}
@@ -480,6 +477,13 @@ WATCHDOG_LOG="${WATCHDOG_LOG}"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN}"
 UPSTREAM_BASE="${_UPSTREAM_BASE}"
 UPSTREAM_MODEL="${_UPSTREAM_MODEL}"
+
+# 优先使用 venv 内的 Python（依赖装在 venv 里，系统 python 缺 httpx 等模块）
+if [ -x "\${SCRIPT_DIR}/venv/bin/python3" ]; then
+    PYTHON_BIN="\${SCRIPT_DIR}/venv/bin/python3"
+else
+    PYTHON_BIN="python3"
+fi
 
 _wd_key_valid() {
     [ -n "\$1" ] || return 1
