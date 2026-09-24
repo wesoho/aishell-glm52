@@ -928,8 +928,14 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
     if stream:
         async def stream_generator():
             state = {"first": True, "done_sent": False, "finish_sent": False,
-                     "usage": None, "chunk_id": "", "model": model or "", "created": 0,
+                     "usage": None, "chunk_id": "", "model": model or "", "created": int(time.time()),
                      "requested_model": model or ""}
+            # 立即发出首个 role chunk：上游首字之前客户端先收到数据，避免客户端首字超时判定失败
+            _preamble = {"id": _make_chunk_id(state), "object": "chat.completion.chunk",
+                         "created": state["created"], "model": state["requested_model"] or state["model"],
+                         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+            yield f"data: {json.dumps(_preamble, ensure_ascii=False)}\n\n"
+            state["first"] = False
             retry_count = 0
             _MAX_RETRY_BOUND = max(MAX_RETRIES, RETRY_CONC_MAX, RETRY_429_MAX)
             while retry_count <= _MAX_RETRY_BOUND:
@@ -977,9 +983,16 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
                                     try:
                                         got = await asyncio.wait_for(stream_q.get(), timeout=2.5)
                                     except asyncio.TimeoutError:
-                                        # 上游思考期可能长时间静默，发 SSE 注释行保活（客户端忽略注释，仅重置读超时）
-                                        logger.info(f"[{request_id}] keepalive -> client")
-                                        yield ": keepalive\n\n"
+                                        # 上游思考期静默：发合法空 delta chunk 保活（注释行会让部分严格 SSE 客户端解析失败）
+                                        state["_ka_n"] = state.get("_ka_n", 0) + 1
+                                        if state["_ka_n"] > 40:
+                                            raise RuntimeError("upstream silence too long (>100s)")
+                                        logger.info(f"[{request_id}] keepalive #{state['_ka_n']}")
+                                        _ka_chunk = {"id": _make_chunk_id(state), "object": "chat.completion.chunk",
+                                                     "created": state.get("created", int(time.time())),
+                                                     "model": state.get("requested_model") or state.get("model", ""),
+                                                     "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
+                                        yield f"data: {json.dumps(_ka_chunk, ensure_ascii=False)}\n\n"
                                         continue
                                     if got is None:
                                         break
