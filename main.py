@@ -377,10 +377,11 @@ async def _upstream_health_task():
         try:
             await asyncio.sleep(UPSTREAM_HEALTH_INTERVAL)
             client = await get_client()
-            resp = await client.get(f"{UPSTREAM_BASE_URL}/models",
-                                    headers={"Authorization": f"Bearer {UPSTREAM_API_KEY}"},
-                                    timeout=httpx.Timeout(5.0, connect=3.0))
-            _upstream_healthy = resp.status_code == 200
+            resp = await client.post(f"{UPSTREAM_BASE_URL}/chat/completions",
+                                         headers={"Authorization": f"Bearer {UPSTREAM_API_KEY}", "Content-Type": "application/json"},
+                                         json={"model": UPSTREAM_DEFAULT_MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                                         timeout=httpx.Timeout(10.0, connect=3.0))
+            _upstream_healthy = resp.status_code in (200, 429, 403)
             _upstream_last_check = time.time()
             if not _upstream_healthy:
                 logger.warning(f"上游健康检查失败: HTTP {resp.status_code}")
