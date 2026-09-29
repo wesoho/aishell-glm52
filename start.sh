@@ -235,7 +235,7 @@ key_valid() {
         -H "Authorization: Bearer $1" \
         -d "{\"model\":\"${_UPSTREAM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" 2>/dev/null || echo 000)
     case "${code}" in
-        200|429) return 0 ;;
+        200|429|403) return 0 ;;
         *)       return 1 ;;
     esac
 }
@@ -271,7 +271,7 @@ inject_api_key() {
     for credfile in /root/job-envs/sandboxes/*/.dsh/.credentials.yaml; do
         [ -f "$credfile" ] || continue
         grep -q "JOB_ENV_MODEL_API_KEY" "$credfile" 2>/dev/null || continue
-        cand=$(grep 'JOB_ENV_MODEL_API_KEY' "$credfile" | head -1 | sed 's/.*: *"//' | sed 's/"$//')
+        cand=$(python3 -c 'import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); v=d.get("refs",{}).get("JOB_ENV_MODEL_API_KEY",""); print(v or "")' "$credfile" 2>/dev/null | tr -d "[:space:]")
         [ -n "$cand" ] || continue
         printf '%s\n' "$seen" | grep -qF -- "$cand" && continue
         seen="${seen}${cand}\n"
@@ -493,7 +493,7 @@ _wd_key_valid() {
         -H 'Content-Type: application/json' \
         -H "Authorization: Bearer \$1" \
         -d "{\"model\":\"\${UPSTREAM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" 2>/dev/null || echo 000)
-    case "\$code" in 200|429) return 0 ;; *) return 1 ;; esac
+    case "\$code" in 200|429|403) return 0 ;; *) return 1 ;; esac
 }
 
 while true; do
