@@ -1,6 +1,6 @@
 {
   "upstream_base_url": "https://tokenhub.developer.huaweicloud.com/v2",
-  "upstream_default_model": "deepseek-v4-flash-0731",
+  "upstream_default_model": "glm-5.2",
   "upstream_models": [
     "glm-5.2",
     "glm-5.1",
@@ -8,9 +8,9 @@
     "deepseek-v4-pro-0813"
   ],
   "model_aliases": {
-    "default": "deepseek-v4-flash-0731",
-    "gpt-3.5-turbo": "deepseek-v4-flash-0731",
-    "gpt-3.5": "deepseek-v4-flash-0731",
+    "default": "glm-5.2",
+    "gpt-3.5-turbo": "glm-5.1",
+    "gpt-3.5": "glm-5.1",
     "gpt-4": "glm-5.2",
     "gpt-4o": "glm-5.2",
     "gpt-4-turbo": "glm-5.2",
