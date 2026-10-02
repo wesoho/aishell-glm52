@@ -33,6 +33,18 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
 
+
+class _AsyncNullContext:
+    """异步空上下文管理器（Python 3.9 没有 asyncnullcontext）"""
+    async def __aenter__(self):
+        return None
+    async def __aexit__(self, *args):
+        return False
+
+
+def _asyncnullcontext():
+    return _AsyncNullContext()
+
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -260,7 +272,7 @@ logger.info(f"Max body size: {MAX_BODY_SIZE // 1024 // 1024}MB, Log rotation: {L
 
 UPSTREAM_TIMEOUT = httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT, write=WRITE_TIMEOUT)
 _http_client: Optional[httpx.AsyncClient] = None
-_semaphore: Optional[asyncio.Semaphore] = None
+_tokenhub_semaphore: Optional[asyncio.Semaphore] = None
 _snap_semaphore: Optional[asyncio.Semaphore] = None
 _inflight_requests = 0
 
@@ -285,11 +297,11 @@ async def get_client() -> httpx.AsyncClient:
     return _http_client
 
 
-def get_semaphore() -> asyncio.Semaphore:
-    global _semaphore
-    if _semaphore is None:
-        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    return _semaphore
+def get_tokenhub_semaphore() -> asyncio.Semaphore:
+    global _tokenhub_semaphore
+    if _tokenhub_semaphore is None:
+        _tokenhub_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    return _tokenhub_semaphore
 
 
 def get_snap_semaphore() -> asyncio.Semaphore:
@@ -298,6 +310,16 @@ def get_snap_semaphore() -> asyncio.Semaphore:
     if _snap_semaphore is None:
         _snap_semaphore = asyncio.Semaphore(SNAP_MAX_CONCURRENT)
     return _snap_semaphore
+
+def _upstream_semaphore_ctx(use_snap: bool):
+    """选择上游信号量。
+    Snap Access: 返回 nullcontext（信号量由 call_upstream_chat 外层持有，包住整个流式生命周期）；
+    TokenHub:    返回独立信号量，与 Snap Access 互不干扰。
+    """
+    if use_snap:
+        return _asyncnullcontext()
+    return get_tokenhub_semaphore()
+
 
 
 # ── 令牌桶限速器 ──
@@ -882,10 +904,12 @@ def _upstream_headers():
 
 
 async def call_upstream_chat(payload: dict, stream: bool = False, request_id: str = ""):
-    """对外入口：Snap Access 请求加并发队列（超过 SNAP_MAX_CONCURRENT 的排队等待），TokenHub 原样直发。
+    """对外入口：两种上游各自独立并发控制，互不干扰。
+    - Snap Access: 用 _snap_semaphore (上限 SNAP_MAX_CONCURRENT)，包住整个请求/流式生命周期
+    - TokenHub:    用 _tokenhub_semaphore (上限 MAX_CONCURRENT)，在 _call_upstream_chat_impl 内部获取
 
-    注意：stream=True 时 _call_upstream_chat_impl 返回 async generator，信号量必须包住生成器
-    的整个迭代生命周期（第一个字节到 [DONE]），否则返回生成器瞬间信号量就被释放、队列形同虚设。
+    注意：stream=True 时 snap 信号量必须包住生成器的整个迭代生命周期（第一个字节到 [DONE]），
+    否则返回生成器瞬间信号量就被释放、队列形同虚设。
     """
     use_snap = _is_snap_access_model(payload.get("model", ""))
     if not use_snap:
@@ -945,7 +969,7 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
                 try:
                     await _wait_cooldown()
                     await get_rate_limiter().acquire()
-                    async with get_semaphore():
+                    async with _upstream_semaphore_ctx(use_snap):
                         async with client.stream("POST", url, headers=headers, **req_kw) as resp:
                             if resp.status_code != 200:
                                 body = await resp.aread()
@@ -1053,7 +1077,7 @@ async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_
             try:
                 await _wait_cooldown()
                 await get_rate_limiter().acquire()
-                async with get_semaphore():
+                async with _upstream_semaphore_ctx(use_snap):
                     resp = await client.post(url, headers=headers, **req_kw)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -1229,7 +1253,7 @@ async def embeddings(raw_request: Request):
     url = f"{UPSTREAM_BASE_URL}/embeddings"
 
     try:
-        async with get_semaphore():
+        async with get_tokenhub_semaphore():
             resp = await client.post(url, json=payload, headers=_upstream_headers())
         if resp.status_code == 200:
             return JSONResponse(content=resp.json())
@@ -1302,6 +1326,10 @@ async def metrics():
         "avg_latency_ms": round(avg_latency, 1),
         "concurrent_limit": MAX_CONCURRENT,
         "inflight_requests": _inflight_requests,
+        "tokenhub_concurrent_limit": MAX_CONCURRENT,
+        "tokenhub_inflight": MAX_CONCURRENT - (get_tokenhub_semaphore()._value if _tokenhub_semaphore else MAX_CONCURRENT),
+        "snap_access_concurrent_limit": SNAP_MAX_CONCURRENT,
+        "snap_access_inflight": SNAP_MAX_CONCURRENT - (get_snap_semaphore()._value if _snap_semaphore else SNAP_MAX_CONCURRENT),
         "upstream": UPSTREAM_BASE_URL,
         "upstream_healthy": _upstream_healthy,
         "tokens": {
