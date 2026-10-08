@@ -92,18 +92,9 @@ UPSTREAM_API_KEY = os.environ.get("JOB_ENV_MODEL_API_KEY", "")
 UPSTREAM_DEFAULT_MODEL = _cfg("upstream_default_model", "deepseek-v4-flash-0731")
 UPSTREAM_MODELS: list = _config.get("upstream_models", ["glm-5.2", "glm-5.1", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813"])
 
-MODEL_ALIASES: Dict[str, str] = _config.get("model_aliases", {
-    "default": UPSTREAM_DEFAULT_MODEL,
-    "gpt-4": "glm-5.2",
-    "gpt-4o": "glm-5.2",
-    "gpt-4-turbo": "glm-5.2",
-    "gpt-3.5-turbo": "deepseek-v4-flash-0731",
-    "gpt-3.5": "deepseek-v4-flash-0731",
-    "claude-3-opus": "glm-5.2",
-    "claude-3-sonnet": "glm-5.2",
-})
-
-ALL_MODELS = list(MODEL_ALIASES.keys()) + UPSTREAM_MODELS
+# ── 两个上游来源标签（同名模型用 @<source> 后缀区分） ──
+SOURCE_TOKENHUB = "tokenhub"
+SOURCE_SNAP = "snap-access"
 
 # ── Snap Access 配置 (华为云 V4 HMAC 签名认证的第二个上游) ──
 _snap_cfg = _config.get("snap_access", {})
@@ -541,24 +532,44 @@ class ChatCompletionRequest(BaseModel):
 # 工具函数
 # ──────────────────────────────────────────────
 
-def _resolve_model(model: str) -> str:
+def _get_model_registry() -> Dict[str, Tuple[str, str]]:
+    """对外模型 id -> (source, real_model) 路由表。
+    两来源同名模型用 @<source> 后缀区分；不冲突时保持原名。"""
+    tokenhub = list(dict.fromkeys(list(UPSTREAM_MODELS) + list(_upstream_models_dynamic)))
+    snap = list(SNAP_ACCESS_MODELS) if SNAP_ACCESS_ENABLED else []
+    common = set(tokenhub) & set(snap)
+    reg: Dict[str, Tuple[str, str]] = {}
+    for m in tokenhub:
+        reg[f"{m}@{SOURCE_TOKENHUB}" if m in common else m] = (SOURCE_TOKENHUB, m)
+    for m in snap:
+        reg[f"{m}@{SOURCE_SNAP}" if m in common else m] = (SOURCE_SNAP, m)
+    return reg
+
+
+def _resolve_route(model: str) -> Tuple[str, str]:
+    """返回 (source, real_model)。空值用默认模型(tokenhub)。"""
     if not model:
-        return UPSTREAM_DEFAULT_MODEL
-    if model in MODEL_ALIASES:
-        return MODEL_ALIASES[model]
-    return model
+        return (SOURCE_TOKENHUB, UPSTREAM_DEFAULT_MODEL)
+    reg = _get_model_registry()
+    if model in reg:
+        return reg[model]
+    return (SOURCE_TOKENHUB, model)
+
+
+def _resolve_model(model: str) -> str:
+    return _resolve_route(model)[1]
+
+
+def _resolve_source(model: str) -> str:
+    return _resolve_route(model)[0]
 
 
 def _get_all_models() -> list:
-    models = set(MODEL_ALIASES.keys())
-    models.update(UPSTREAM_MODELS)
-    models.update(_upstream_models_dynamic)
-    models.update(SNAP_ACCESS_MODELS)
-    return sorted(models)
+    return sorted(_get_model_registry().keys())
 
 
 def _validate_model(model: str) -> Optional[str]:
-    if not model or model in MODEL_ALIASES or model in UPSTREAM_MODELS or model in _upstream_models_dynamic or model in SNAP_ACCESS_MODELS:
+    if not model or model in _get_model_registry():
         return None
     return f"The model '{model}' does not exist. Available models: {', '.join(_get_all_models())}"
 
@@ -719,8 +730,9 @@ def _truncate_messages(messages: list, max_tokens: int) -> tuple:
 
 
 def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
+    source, real_model = _resolve_route(body.get("model", ""))
     payload = {
-        "model": _resolve_model(body.get("model", "default")),
+        "model": real_model,
         "messages": body.get("messages", []),
         "stream": is_stream,
     }
@@ -737,6 +749,7 @@ def _build_upstream_payload(body: dict, is_stream: bool) -> dict:
             payload["stream_options"] = {"include_usage": True}
         elif isinstance(payload["stream_options"], dict) and not payload["stream_options"].get("include_usage"):
             payload["stream_options"]["include_usage"] = True
+    payload["_source"] = source
     return payload
 
 
@@ -870,9 +883,9 @@ SSE_HEADERS = {
 # 上游调用
 # ──────────────────────────────────────────────
 
-def _is_snap_access_model(model: str) -> bool:
-    """判断模型是否走 Snap Access 上游"""
-    return model in SNAP_ACCESS_MODELS
+def _is_snap_source(source: str) -> bool:
+    """判断来源是否为 Snap Access 上游"""
+    return source == SOURCE_SNAP
 
 
 def _build_snap_headers(method: str, url: str, body_str: str) -> dict:
@@ -911,7 +924,7 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
     注意：stream=True 时 snap 信号量必须包住生成器的整个迭代生命周期（第一个字节到 [DONE]），
     否则返回生成器瞬间信号量就被释放、队列形同虚设。
     """
-    use_snap = _is_snap_access_model(payload.get("model", ""))
+    use_snap = _is_snap_source(payload.get("_source", SOURCE_TOKENHUB))
     if not use_snap:
         return await _call_upstream_chat_impl(payload, stream=stream, request_id=request_id)
 
@@ -935,7 +948,8 @@ async def call_upstream_chat(payload: dict, stream: bool = False, request_id: st
 
 async def _call_upstream_chat_impl(payload: dict, stream: bool = False, request_id: str = ""):
     model = payload.get("model", "")
-    use_snap = _is_snap_access_model(model)
+    source = payload.pop("_source", SOURCE_TOKENHUB)
+    use_snap = _is_snap_source(source)
     if use_snap:
         # 对配置的模型默认关闭深度思考（Snap Access 上游思考期可长达 10s+，客户端易误判超时）
         if model in SNAP_DISABLE_THINKING_MODELS and "thinking" not in payload:
@@ -1123,7 +1137,7 @@ async def chat_completions(raw_request: Request):
     except Exception as e:
         return _openai_error(f"Invalid JSON: {e}", 400, "invalid_request_error")
 
-    model_input = body.get("model", "default")
+    model_input = body.get("model", "")
     model_err = _validate_model(model_input)
     if model_err:
         return _openai_error(model_err, 404, "invalid_request_error")
@@ -1188,15 +1202,16 @@ async def completions(raw_request: Request):
         return _openai_error(f"Invalid JSON: {e}", 400)
 
     prompt = body.get("prompt", "")
-    model_input = body.get("model", "default")
+    model_input = body.get("model", "")
     model_err = _validate_model(model_input)
     if model_err:
         return _openai_error(model_err, 404)
 
-    model = _resolve_model(model_input)
+    source, model = _resolve_route(model_input)
     is_stream = body.get("stream", False)
     chat_payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
-                    "stream": is_stream, "max_tokens": body.get("max_tokens") or DEFAULT_MAX_TOKENS}
+                    "stream": is_stream, "max_tokens": body.get("max_tokens") or DEFAULT_MAX_TOKENS,
+                    "_source": source}
     for key in ("temperature", "top_p"):
         if key in body and body[key] is not None:
             chat_payload[key] = body[key]
@@ -1226,16 +1241,9 @@ async def completions(raw_request: Request):
 async def list_models():
     now = int(time.time())
     data = []
-    for alias in MODEL_ALIASES:
-        data.append({"id": alias, "object": "model", "created": now, "owned_by": "system"})
-    for model_id in UPSTREAM_MODELS:
-        data.append({"id": model_id, "object": "model", "created": now, "owned_by": "huawei-cloud"})
-    for model_id in _upstream_models_dynamic:
-        if model_id not in UPSTREAM_MODELS and model_id not in MODEL_ALIASES:
-            data.append({"id": model_id, "object": "model", "created": now, "owned_by": "huawei-cloud-dynamic"})
-    for model_id in SNAP_ACCESS_MODELS:
-        if model_id not in UPSTREAM_MODELS and model_id not in MODEL_ALIASES:
-            data.append({"id": model_id, "object": "model", "created": now, "owned_by": "huawei-cloud-snap-access"})
+    for mid, (source, _real) in _get_model_registry().items():
+        owned = "huawei-cloud-snap-access" if source == SOURCE_SNAP else "huawei-cloud"
+        data.append({"id": mid, "object": "model", "created": now, "owned_by": owned})
     return {"object": "list", "data": data}
 
 
@@ -1247,7 +1255,7 @@ async def embeddings(raw_request: Request):
     except Exception as e:
         return _openai_error(f"Invalid JSON: {e}", 400)
 
-    model = _resolve_model(body.get("model", "default"))
+    model = _resolve_model(body.get("model", ""))
     payload = {**body, "model": model}
     client = await get_client()
     url = f"{UPSTREAM_BASE_URL}/embeddings"
@@ -1348,7 +1356,10 @@ async def root():
         "snap_access_upstream": SNAP_ACCESS_BASE_URL,
         "snap_access_enabled": SNAP_ACCESS_ENABLED,
         "available_models": _get_all_models(),
-        "model_aliases": MODEL_ALIASES,
+        "model_sources": {
+            SOURCE_TOKENHUB: [m for _mid, (s, m) in _get_model_registry().items() if s == SOURCE_TOKENHUB],
+            SOURCE_SNAP: [m for _mid, (s, m) in _get_model_registry().items() if s == SOURCE_SNAP],
+        },
         "endpoints": {
             "chat": "/v1/chat/completions",
             "completions": "/v1/completions",

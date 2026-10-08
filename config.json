@@ -7,16 +7,6 @@
     "deepseek-v4-flash-0731",
     "deepseek-v4-pro-0813"
   ],
-  "model_aliases": {
-    "default": "glm-5.2",
-    "gpt-3.5-turbo": "glm-5.1",
-    "gpt-3.5": "glm-5.1",
-    "gpt-4": "glm-5.2",
-    "gpt-4o": "glm-5.2",
-    "gpt-4-turbo": "glm-5.2",
-    "claude-3-opus": "glm-5.2",
-    "claude-3-sonnet": "glm-5.2"
-  },
   "snap_access": {
     "base_url": "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2",
     "region": "cn-north-4",
