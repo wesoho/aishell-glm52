@@ -123,8 +123,8 @@ RETRY_BACKOFF = _cfg("retry_backoff", 0.5, float)
 
 MAX_CONCURRENT = _cfg("max_concurrent", 20, int)
 
-# Snap Access 上游并发会话上限（盘古硬限制 3 个并发会话，留 1 余量防残留顶满；超出的请求排队等待）
-SNAP_MAX_CONCURRENT = _cfg("snap_max_concurrent", 2, int)
+# Snap Access 上游并发会话上限（超过的请求在信号量处排队等待，不直接打上游触发“并发会话数已达上限”）
+SNAP_MAX_CONCURRENT = int(_snap_cfg.get("max_concurrent", 3))
 
 # 上游速率限制 (令牌桶)
 UPSTREAM_RATE_LIMIT = _cfg("upstream_rate_limit", 4, float)   # 每秒允许请求数
