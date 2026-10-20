@@ -1,0 +1,52 @@
+{
+  "upstream_base_url": "https://tokenhub.developer.huaweicloud.com/v2",
+  "upstream_default_model": "glm-5.2",
+  "upstream_models": [
+    "glm-5.2",
+    "glm-5.1"
+  ],
+  "snap_access": {
+    "base_url": "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2",
+    "region": "cn-north-4",
+    "models": [
+      "openpangu-2.0-flash",
+      "openpangu-2.0-pro",
+      "openpangu-2.0-ultra",
+      "openpangu-2.0-lite",
+      "openpangu-2.0-base",
+      "openpangu-2.0-mini",
+      "glm-5.2-sft-harmony",
+      "glm-5.2-sft",
+      "glm-5.2-flash",
+      "glm-5.2-pro",
+      "glm-5.1-sft",
+      "glm-5.1-flash",
+      "deepseek-v4-flash-0731",
+      "deepseek-v4-pro-0813",
+      "qwen-max",
+      "qwen-plus",
+      "qwen-turbo",
+      "qwen-7b",
+      "qwen-14b",
+      "qwen-32b",
+      "qwen-72b",
+      "yi-large",
+      "yi-medium",
+      "yi-spark",
+      "hunyuan-pro",
+      "hunyuan-standard",
+      "llama3-70b",
+      "llama3-8b",
+      "moonshot-v1-32k",
+      "ernie-4",
+      "baichuan-53b",
+      "spark-desk-v3",
+      "chatglm-turbo",
+      "chatglm-pro"
+    ],
+    "max_concurrent": 3,
+    "disable_thinking_models": [
+      "glm-5.2-sft-harmony"
+    ]
+  }
+}
