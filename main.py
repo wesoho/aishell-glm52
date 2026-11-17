@@ -547,8 +547,8 @@ def _get_model_registry() -> Dict[str, Tuple[str, str]]:
 
 
 def _resolve_route(model: str) -> Tuple[str, str]:
-    """返回 (source, real_model)。空值用默认模型(tokenhub)。"""
-    if not model:
+    """返回 (source, real_model)。空值或 'default' 用默认模型(tokenhub)。"""
+    if not model or model == "default":
         return (SOURCE_TOKENHUB, UPSTREAM_DEFAULT_MODEL)
     reg = _get_model_registry()
     if model in reg:
@@ -569,7 +569,7 @@ def _get_all_models() -> list:
 
 
 def _validate_model(model: str) -> Optional[str]:
-    if not model or model in _get_model_registry():
+    if not model or model == "default" or model in _get_model_registry():
         return None
     return f"The model '{model}' does not exist. Available models: {', '.join(_get_all_models())}"
 
