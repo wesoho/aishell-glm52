@@ -8,7 +8,7 @@ OpenAI 兼容 API 代理服务，双上游代理到华为云模型 (TokenHub + S
 - ✅ **双上游路由** — TokenHub (Bearer token) + Snap Access (V4 HMAC 签名)，按模型名自动路由
 - ✅ 流式 SSE 严格对齐 OpenAI 格式 (chatcmpl- ID, role/content 分离, finish_reason, usage)
 - ✅ 兼容两种 SSE 格式 (TokenHub `data: {...}` 和 Snap Access `data:{...}`)
-- ✅ 模型别名映射 (`gpt-4` → `glm-5.2`, `gpt-3.5-turbo` → `deepseek-v4-flash-0731` 等)
+- ✅ 未知模型名透传 TokenHub (如传 `gpt-4` 则原样转发上游)
 - ✅ 上游错误自动重试 (指数退避, 5xx/429/连接错误)
 - ✅ **令牌桶限速器** — 控制发往上游的请求速率，避免 429
 - ✅ **全局 429 熔断冷却** — 收到 429 后所有请求暂停，避免连续触发限速
@@ -26,17 +26,19 @@ OpenAI 兼容 API 代理服务，双上游代理到华为云模型 (TokenHub + S
 ```
 客户端请求
     │
-    ├─ model = glm-5.2 / deepseek-v4-* → TokenHub (Bearer token)
-    │                                      tokenhub.developer.huaweicloud.com/v2
+    ├─ model = glm-5.2 / glm-5.1 / glm-5.3 / deepseek-v4.1-flash → TokenHub (Bearer token)
+    │                                                              tokenhub.developer.huaweicloud.com/v2
     │
-    └─ model = openpangu-* / glm-5.2-sft-harmony → Snap Access (V4 HMAC 签名)
+    └─ model = openpangu-* / qwen-* / glm-5.2-sft / deepseek-v4-* / yi-* / ... → Snap Access (V4 HMAC 签名)
                                            snap-access.cn-north-4.myhuaweicloud.com/api/v2
 ```
 
-| 上游 | 认证方式 | 模型 |
-|------|---------|------|
-| TokenHub | Bearer token (`JOB_ENV_MODEL_API_KEY`) | glm-5.2, glm-5.1, deepseek-v4-flash-0731, deepseek-v4-pro-0813 |
-| Snap Access | 华为云 V4 HMAC 签名 (AK/SK) | openpangu-2.0-flash, openpangu-2.0-pro, glm-5.2-sft-harmony |
+| 上游 | 认证方式 | 模型数 | 模型 |
+|------|---------|--------|------|
+| TokenHub | Bearer token (`JOB_ENV_MODEL_API_KEY`) | 4 | glm-5.2, glm-5.1, glm-5.3, deepseek-v4.1-flash |
+| Snap Access | 华为云 V4 HMAC 签名 (AK/SK) | 36 | openpangu-2.0-*, glm-5.2-sft-*, glm-5.2-flash/pro, glm-5.1-sft/flash, glm-5.3, deepseek-v4.1-flash, deepseek-v4-flash-0731, deepseek-v4-pro-0813, qwen-*, yi-*, hunyuan-*, llama3-*, moonshot-v1-32k, ernie-4, baichuan-53b, spark-desk-v3, chatglm-turbo/pro |
+
+> glm-5.3 和 deepseek-v4.1-flash 同时存在于两个上游，用 `glm-5.3@tokenhub` / `glm-5.3@snap-access` 后缀区分；不带后缀则默认走 TokenHub。
 
 Snap Access 使用华为云标准 V4 HMAC 签名认证（非 Bearer token），通过 `huaweicloudsdkcore` SDK 完成签名，每个请求动态生成 `Authorization: SDK-HMAC-SHA256 ...` 头。
 
@@ -110,7 +112,19 @@ bash install.sh          # 自动装依赖 + cloudflared + 注入 AK/SK + 启动
   "snap_access": {
     "base_url": "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2",
     "region": "cn-north-4",
-    "models": ["openpangu-2.0-flash", "openpangu-2.0-pro", "glm-5.2-sft-harmony"]
+    "models": [
+      "deepseek-v4.1-flash", "glm-5.3",
+      "openpangu-2.0-flash", "openpangu-2.0-pro", "openpangu-2.0-ultra",
+      "openpangu-2.0-lite", "openpangu-2.0-base", "openpangu-2.0-mini",
+      "glm-5.2-sft-harmony", "glm-5.2-sft", "glm-5.2-flash", "glm-5.2-pro",
+      "glm-5.1-sft", "glm-5.1-flash",
+      "deepseek-v4-flash-0731", "deepseek-v4-pro-0813",
+      "qwen-max", "qwen-plus", "qwen-turbo", "qwen-7b", "qwen-14b", "qwen-32b", "qwen-72b",
+      "yi-large", "yi-medium", "yi-spark",
+      "hunyuan-pro", "hunyuan-standard",
+      "llama3-70b", "llama3-8b", "moonshot-v1-32k",
+      "ernie-4", "baichuan-53b", "spark-desk-v3", "chatglm-turbo", "chatglm-pro"
+    ]
   }
 }
 ```
@@ -127,23 +141,58 @@ AK/SK 通过环境变量传入（`start.sh` 会自动从凭证文件注入）：
 
 ## 模型列表
 
-### TokenHub 模型 (Bearer token 认证)
+> 共 40 个模型。运行 `curl http://localhost:8080/v1/models` 可动态获取最新列表。
+> 默认模型（model 为空或 `default`）：**glm-5.2**
 
-| 客户端模型名 | 实际上游模型 |
-|------------|------------|
-| `default` | deepseek-v4-flash-0731 |
-| `gpt-4` / `gpt-4o` / `gpt-4-turbo` | glm-5.2 |
-| `gpt-3.5-turbo` / `gpt-3.5` | deepseek-v4-flash-0731 |
-| `claude-3-opus` / `claude-3-sonnet` | glm-5.2 |
-| `glm-5.2` / `glm-5.1` / `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` | 原样传递 |
-
-### Snap Access 模型 (V4 HMAC 签名认证)
+### TokenHub 模型 (Bearer token 认证，4 个)
 
 | 模型名 | 说明 |
 |-------|------|
-| `openpangu-2.0-flash` | 盘古 flash 模型 (快速) |
-| `openpangu-2.0-pro` | 盘古 pro 模型 (高质量) |
+| `glm-5.2` | GLM-5.2 (默认模型) |
+| `glm-5.1` | GLM-5.1 |
+| `glm-5.3@tokenhub` | GLM-5.3 走 TokenHub (与 Snap Access 同名，加后缀区分) |
+| `deepseek-v4.1-flash@tokenhub` | DeepSeek V4.1 Flash 走 TokenHub (与 Snap Access 同名，加后缀区分) |
+
+### Snap Access 模型 (V4 HMAC 签名认证，36 个)
+
+| 模型名 | 说明 |
+|-------|------|
+| `glm-5.3@snap-access` | GLM-5.3 走 Snap Access |
+| `deepseek-v4.1-flash@snap-access` | DeepSeek V4.1 Flash 走 Snap Access |
+| `openpangu-2.0-ultra` | 盘古 Ultra (最强) |
+| `openpangu-2.0-pro` | 盘古 Pro (高质量) |
+| `openpangu-2.0-flash` | 盘古 Flash (快速) |
+| `openpangu-2.0-lite` | 盘古 Lite (轻量) |
+| `openpangu-2.0-base` | 盘古 Base |
+| `openpangu-2.0-mini` | 盘古 Mini (最小) |
+| `glm-5.2-pro` | GLM-5.2 Pro |
+| `glm-5.2-flash` | GLM-5.2 Flash |
+| `glm-5.2-sft` | GLM-5.2 SFT |
 | `glm-5.2-sft-harmony` | GLM-5.2 SFT 调和版 |
+| `glm-5.1-flash` | GLM-5.1 Flash |
+| `glm-5.1-sft` | GLM-5.1 SFT |
+| `deepseek-v4-pro-0813` | DeepSeek V4 Pro (0813) |
+| `deepseek-v4-flash-0731` | DeepSeek V4 Flash (0731) |
+| `qwen-max` | 通义千问 Max |
+| `qwen-plus` | 通义千问 Plus |
+| `qwen-turbo` | 通义千问 Turbo |
+| `qwen-72b` | 通义千问 72B |
+| `qwen-32b` | 通义千问 32B |
+| `qwen-14b` | 通义千问 14B |
+| `qwen-7b` | 通义千问 7B |
+| `yi-large` | 零一万物 Yi Large |
+| `yi-medium` | 零一万物 Yi Medium |
+| `yi-spark` | 零一万物 Yi Spark |
+| `hunyuan-pro` | 腾讯混元 Pro |
+| `hunyuan-standard` | 腾讯混元 Standard |
+| `llama3-70b` | Llama3 70B |
+| `llama3-8b` | Llama3 8B |
+| `moonshot-v1-32k` | Moonshot V1 32K |
+| `ernie-4` | 文心一言 4 |
+| `baichuan-53b` | 百川 53B |
+| `spark-desk-v3` | 讯飞星火 V3 |
+| `chatglm-turbo` | ChatGLM Turbo |
+| `chatglm-pro` | ChatGLM Pro |
 
 ## API 端点
 
@@ -183,7 +232,7 @@ AK/SK 通过环境变量传入（`start.sh` 会自动从凭证文件注入）：
 ```
 API Base URL: https://<tunnel>.trycloudflare.com/v1
 API Key:      any (不校验)
-Model:        gpt-4 (或 glm-5.2, default, openpangu-2.0-flash 等)
+Model:        glm-5.2 (或 default, openpangu-2.0-pro, qwen-max 等，共 40 个可选)
 ```
 
 ## 经验教训
